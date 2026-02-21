@@ -7,16 +7,14 @@ from pathlib import PurePath
 
 from ouestcharlie_toolkit.backend import Backend
 from ouestcharlie_toolkit.manifest import ManifestStore
-from ouestcharlie_toolkit.photo import Photo
 from ouestcharlie_toolkit.schema import (
     SCHEMA_VERSION,
     LeafManifest,
     PartitionSummary,
     PhotoEntry,
-    VersionToken,
+    XmpSidecar,
 )
-from ouestcharlie_toolkit.xmp import XmpStore, xmp_path_for
-from ouestcharlie_toolkit.schema import XmpSidecar
+from ouestcharlie_toolkit.xmp import XmpStore
 
 
 # Photo file extensions indexed by Whitebeard (case-insensitive).
@@ -78,7 +76,7 @@ async def index_partition(
         result.photos_processed += 1
         filename = PurePath(file_info.path).name
         try:
-            entry, created = await _process_one(backend, xmp_store, file_info.path, force)
+            entry, created = await _process_one(xmp_store, file_info.path, force)
             photo_entries.append(entry)
             if created:
                 result.sidecars_created += 1
@@ -118,7 +116,6 @@ def _filter_photo_files(
 
 
 async def _process_one(
-    backend: Backend,
     xmp_store: XmpStore,
     photo_path: str,
     force: bool,
@@ -128,41 +125,12 @@ async def _process_one(
     Returns:
         (PhotoEntry, created) where created=True if a new sidecar was written.
     """
-    filename = PurePath(photo_path).name
-
-    # Try to read an existing sidecar.
-    existing_sidecar: XmpSidecar | None = None
-    existing_version: VersionToken | None = None
-    try:
-        existing_sidecar, existing_version = await xmp_store.read(photo_path)
-    except FileNotFoundError:
-        pass
-
-    if existing_sidecar is not None and not force:
-        # Preserve the existing sidecar — just read the hash.
-        content_hash = existing_sidecar.content_hash or ""
-        if not content_hash:
-            # Third-party sidecar without ouestcharlie:contentHash — compute it.
-            content_hash = await Photo(backend, photo_path).create_identity()
-        entry = _sidecar_to_entry(
-            filename, existing_sidecar, content_hash, str(existing_version.value)  # type: ignore[union-attr]
-        )
-        return entry, False
-
-    # Extract EXIF (for a new photo or force re-index).
-    photo = Photo(backend, photo_path)
-    sidecar = await photo.extract_exif()
-
-    if existing_version is not None:
-        # Overwrite existing sidecar (force=True path).
-        new_version = await xmp_store.write(photo_path, sidecar, existing_version)
-    else:
-        new_version = await xmp_store.create(photo_path, sidecar)
-
-    entry = _sidecar_to_entry(
-        filename, sidecar, sidecar.content_hash or "", str(new_version.value)
+    sidecar, version, created = await xmp_store.read_or_create_from_picture(
+        photo_path, force=force
     )
-    return entry, True
+    filename = PurePath(photo_path).name
+    entry = _sidecar_to_entry(filename, sidecar, sidecar.content_hash or "", str(version.value))
+    return entry, created
 
 
 def _sidecar_to_entry(
