@@ -36,6 +36,26 @@ class IndexResult:
     sidecars_skipped: int = 0
     errors: int = 0
     error_details: list[str] = field(default_factory=list)
+    summary: PartitionSummary | None = None
+
+
+@dataclass
+class LibraryIndexResult:
+    """Result of indexing an entire photo library (all partitions)."""
+
+    partitions: list[IndexResult] = field(default_factory=list)
+
+    @property
+    def total_photos(self) -> int:
+        return sum(r.photos_processed for r in self.partitions)
+
+    @property
+    def total_sidecars_created(self) -> int:
+        return sum(r.sidecars_created for r in self.partitions)
+
+    @property
+    def total_errors(self) -> int:
+        return sum(r.errors for r in self.partitions)
 
 
 async def index_partition(
@@ -87,13 +107,160 @@ async def index_partition(
             result.error_details.append(f"{filename}: {exc}")
 
     # Build or update the leaf manifest.
-    await _upsert_leaf_manifest(manifest_store, partition, photo_entries)
+    result.summary = await _upsert_leaf_manifest(manifest_store, partition, photo_entries)
 
     return result
 
 
+async def index_library(
+    backend: Backend,
+    root: str = "",
+    force: bool = False,
+) -> LibraryIndexResult:
+    """Recursively index all photos in a library and build hierarchical manifests.
+
+    Walks all subdirectories under ``root``, indexes each folder that contains
+    photos as a leaf partition, then builds parent manifests bottom-up so every
+    ancestor folder has an aggregate manifest summarising its children.
+
+    Args:
+        backend: Backend to read/write.
+        root: Library root relative to the backend root (e.g. "" for the full
+            backend, "Vacations/" to scope to a subfolder).
+        force: If True, re-extract EXIF and overwrite existing XMP sidecars.
+
+    Returns:
+        LibraryIndexResult aggregating every per-partition IndexResult.
+    """
+    library_result = LibraryIndexResult()
+    manifest_store = ManifestStore(backend)
+
+    # Discover all leaf partitions (directories directly containing photos).
+    all_files = await backend.list_files(root)
+    leaf_partitions = _discover_leaf_partitions(all_files, root)
+
+    # Index each leaf partition, collecting summaries.
+    leaf_summaries: dict[str, PartitionSummary] = {}
+    for partition in sorted(leaf_partitions):
+        partition_result = await index_partition(backend, partition, force)
+        library_result.partitions.append(partition_result)
+        if partition_result.summary is not None:
+            leaf_summaries[partition] = partition_result.summary
+
+    # Build parent manifests bottom-up.
+    await _build_parent_manifests(manifest_store, leaf_summaries, root)
+
+    return library_result
+
+
 # ---------------------------------------------------------------------------
-# Internal helpers
+# Internal helpers — partition discovery
+# ---------------------------------------------------------------------------
+
+
+def _discover_leaf_partitions(files: list, root: str) -> set[str]:
+    """Return the set of unique partition paths that directly contain photos.
+
+    A partition is the immediate parent directory of a photo file.
+    """
+    leaf_partitions: set[str] = set()
+    for f in files:
+        if PurePath(f.path).suffix.lower() not in PHOTO_EXTENSIONS:
+            continue
+        slash_pos = f.path.rfind("/")
+        if slash_pos == -1:
+            # Photo at top level; partition is the root itself.
+            parent = root
+        else:
+            parent = f.path[:slash_pos]
+        leaf_partitions.add(parent)
+    return leaf_partitions
+
+
+def _direct_parent(partition: str) -> str:
+    """Return the immediate parent of a partition path (empty string = root)."""
+    if "/" not in partition:
+        return ""
+    return partition.rsplit("/", 1)[0]
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers — parent manifest construction
+# ---------------------------------------------------------------------------
+
+
+async def _build_parent_manifests(
+    manifest_store: ManifestStore,
+    leaf_summaries: dict[str, PartitionSummary],
+    library_root: str = "",
+) -> None:
+    """Build parent manifests from leaf summaries, bottom-up.
+
+    For each ancestor folder of any leaf partition (up to ``library_root``),
+    creates or updates a parent manifest whose children are the immediate
+    sub-partitions at that level, with aggregated photo counts and date ranges.
+    """
+    if not leaf_summaries:
+        return
+
+    # all_summaries starts with leaves; parent summaries are added as computed.
+    all_summaries: dict[str, PartitionSummary] = dict(leaf_summaries)
+
+    # Collect all ancestor paths that need parent manifests.
+    parent_paths: set[str] = set()
+    for partition in leaf_summaries:
+        current = partition
+        while current != library_root:
+            parent = _direct_parent(current)
+            parent_paths.add(parent)
+            if parent == library_root:
+                break
+            current = parent
+
+    if not parent_paths:
+        return
+
+    # Process deepest paths first (most path components), root last.
+    def _depth(p: str) -> int:
+        return len(p.split("/")) if p else 0
+
+    sorted_parents = sorted(parent_paths, key=_depth, reverse=True)
+    # Ensure library_root is always last (may already be in the list).
+    if library_root in sorted_parents:
+        sorted_parents.remove(library_root)
+    sorted_parents.append(library_root)
+
+    for parent_path in sorted_parents:
+        # Collect direct children of this parent from all known summaries.
+        direct_children = [
+            summary
+            for path, summary in all_summaries.items()
+            if _direct_parent(path) == parent_path and path != parent_path
+        ]
+        if not direct_children:
+            continue
+
+        # Compute and cache this parent's aggregate summary.
+        all_summaries[parent_path] = _aggregate_summary(parent_path, direct_children)
+
+        await manifest_store.rebuild_parent(parent_path, direct_children)
+
+
+def _aggregate_summary(path: str, children: list[PartitionSummary]) -> PartitionSummary:
+    """Aggregate child summaries into a single parent-level summary."""
+    total = sum(c.photo_count for c in children)
+    dates_min = [c.date_min for c in children if c.date_min is not None]
+    dates_max = [c.date_max for c in children if c.date_max is not None]
+    return PartitionSummary(
+        path=path,
+        photo_count=total,
+        date_min=min(dates_min) if dates_min else None,
+        date_max=max(dates_max) if dates_max else None,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers — single-file processing
 # ---------------------------------------------------------------------------
 
 
@@ -172,8 +339,12 @@ async def _upsert_leaf_manifest(
     manifest_store: ManifestStore,
     partition: str,
     photo_entries: list[PhotoEntry],
-) -> None:
-    """Create or update the leaf manifest for the partition."""
+) -> PartitionSummary:
+    """Create or update the leaf manifest for the partition.
+
+    Returns:
+        The PartitionSummary written into the manifest.
+    """
     summary = _compute_summary(partition, photo_entries)
     manifest = LeafManifest(
         schema_version=SCHEMA_VERSION,
@@ -187,3 +358,4 @@ async def _upsert_leaf_manifest(
         await manifest_store.write_leaf(manifest, version)
     except FileNotFoundError:
         await manifest_store.create_leaf(manifest)
+    return summary

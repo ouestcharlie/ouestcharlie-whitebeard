@@ -13,7 +13,13 @@ from ouestcharlie_toolkit.backends.local import LocalBackend
 from ouestcharlie_toolkit.schema import METADATA_DIR, manifest_path
 from ouestcharlie_toolkit.xmp import parse_xmp, xmp_path_for
 
-from whitebeard.indexer import PHOTO_EXTENSIONS, IndexResult, index_partition
+from whitebeard.indexer import (
+    PHOTO_EXTENSIONS,
+    IndexResult,
+    LibraryIndexResult,
+    index_library,
+    index_partition,
+)
 
 # Sample JPEG from the py-toolkit test suite.
 _SAMPLE_JPG = (
@@ -236,3 +242,126 @@ async def test_index_sub_partition(tmpdir: Path) -> None:
     assert manifest_file.exists()
     data = json.loads(manifest_file.read_text())
     assert data["partition"] == "Vacations/Italy"
+
+
+# ---------------------------------------------------------------------------
+# index_library — recursive indexing and parent manifests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_index_library_single_partition(tmpdir: Path) -> None:
+    """index_library with photos only at root creates a leaf manifest, no parent."""
+    (tmpdir / "photo.jpg").write_bytes(_MINIMAL_JPEG)
+    backend = LocalBackend(root=str(tmpdir))
+
+    result = await index_library(backend)
+
+    assert isinstance(result, LibraryIndexResult)
+    assert len(result.partitions) == 1
+    assert result.total_photos == 1
+    # Leaf manifest exists.
+    assert (tmpdir / METADATA_DIR / "manifest.json").exists()
+    # No parent manifest (nothing to summarise above a single leaf at root).
+    # The root IS the leaf, so no deeper parent manifest is needed.
+
+
+@pytest.mark.asyncio
+async def test_index_library_builds_parent_manifest(tmpdir: Path) -> None:
+    """Two leaf partitions under a common parent produce a parent manifest."""
+    (tmpdir / "2024" / "2024-07").mkdir(parents=True)
+    (tmpdir / "2024" / "2024-08").mkdir(parents=True)
+    (tmpdir / "2024" / "2024-07" / "a.jpg").write_bytes(_MINIMAL_JPEG)
+    (tmpdir / "2024" / "2024-08" / "b.jpg").write_bytes(_MINIMAL_JPEG)
+    backend = LocalBackend(root=str(tmpdir))
+
+    result = await index_library(backend)
+
+    assert result.total_photos == 2
+    assert len(result.partitions) == 2
+
+    # Leaf manifests.
+    assert (tmpdir / "2024" / "2024-07" / METADATA_DIR / "manifest.json").exists()
+    assert (tmpdir / "2024" / "2024-08" / METADATA_DIR / "manifest.json").exists()
+
+    # Parent manifest for 2024/.
+    parent_file = tmpdir / "2024" / METADATA_DIR / "manifest.json"
+    assert parent_file.exists()
+    parent_data = json.loads(parent_file.read_text())
+    assert len(parent_data["children"]) == 2
+    child_paths = {c["path"] for c in parent_data["children"]}
+    assert "2024/2024-07" in child_paths
+    assert "2024/2024-08" in child_paths
+
+    # Root parent manifest.
+    root_file = tmpdir / METADATA_DIR / "manifest.json"
+    assert root_file.exists()
+    root_data = json.loads(root_file.read_text())
+    assert any(c["path"] == "2024" for c in root_data["children"])
+
+
+@pytest.mark.asyncio
+async def test_index_library_three_levels(tmpdir: Path) -> None:
+    """Three-level hierarchy: root → year → month → photos."""
+    (tmpdir / "2024" / "July" / "Vacation").mkdir(parents=True)
+    shutil.copy(_SAMPLE_JPG, tmpdir / "2024" / "July" / "Vacation" / "001.jpg")
+    backend = LocalBackend(root=str(tmpdir))
+
+    await index_library(backend)
+
+    # Leaf at 2024/July/Vacation.
+    assert (tmpdir / "2024" / "July" / "Vacation" / METADATA_DIR / "manifest.json").exists()
+    # Parent at 2024/July.
+    assert (tmpdir / "2024" / "July" / METADATA_DIR / "manifest.json").exists()
+    # Parent at 2024.
+    assert (tmpdir / "2024" / METADATA_DIR / "manifest.json").exists()
+    # Root parent.
+    assert (tmpdir / METADATA_DIR / "manifest.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_index_library_parent_photo_count(tmpdir: Path) -> None:
+    """Parent manifest photoCount aggregates all children."""
+    (tmpdir / "A").mkdir()
+    (tmpdir / "B").mkdir()
+    (tmpdir / "A" / "p1.jpg").write_bytes(_MINIMAL_JPEG)
+    (tmpdir / "A" / "p2.jpg").write_bytes(_MINIMAL_JPEG)
+    (tmpdir / "B" / "p3.jpg").write_bytes(_MINIMAL_JPEG)
+    backend = LocalBackend(root=str(tmpdir))
+
+    await index_library(backend)
+
+    root_data = json.loads((tmpdir / METADATA_DIR / "manifest.json").read_text())
+    total = sum(c["photoCount"] for c in root_data["children"])
+    assert total == 3
+
+
+@pytest.mark.asyncio
+async def test_index_library_result_totals(tmpdir: Path) -> None:
+    """LibraryIndexResult aggregates counts across all partitions."""
+    (tmpdir / "A").mkdir()
+    (tmpdir / "B").mkdir()
+    (tmpdir / "A" / "p1.jpg").write_bytes(_MINIMAL_JPEG)
+    (tmpdir / "B" / "p2.jpg").write_bytes(_MINIMAL_JPEG)
+    backend = LocalBackend(root=str(tmpdir))
+
+    result = await index_library(backend)
+
+    assert result.total_photos == 2
+    assert result.total_sidecars_created == 2
+    assert result.total_errors == 0
+
+
+@pytest.mark.asyncio
+async def test_index_library_idempotent(tmpdir: Path) -> None:
+    """Running index_library twice with the same library is idempotent."""
+    (tmpdir / "A").mkdir()
+    (tmpdir / "A" / "p.jpg").write_bytes(_MINIMAL_JPEG)
+    backend = LocalBackend(root=str(tmpdir))
+
+    await index_library(backend)
+    result2 = await index_library(backend)
+
+    assert result2.total_photos == 1
+    assert result2.total_sidecars_created == 0  # sidecar already exists
+    assert result2.total_errors == 0

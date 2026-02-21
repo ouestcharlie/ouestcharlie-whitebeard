@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from ouestcharlie_toolkit.server import AgentBase
 
-from .indexer import index_partition
+from .indexer import index_library, index_partition
 
 
 class WhitebeardAgent(AgentBase):
@@ -52,4 +52,33 @@ class WhitebeardAgent(AgentBase):
                 "sidecarsCreated": result.sidecars_created,
                 "sidecarsSkipped": result.sidecars_skipped,
                 "errors": result.errors,
+            }
+
+        @mcp.tool()
+        async def index_library_tool(
+            root: str = "",
+            force: bool = False,
+        ) -> dict:
+            """Recursively index all photos in the library and build manifests.
+
+            Walks every subfolder under ``root``, indexes each folder that
+            contains photos as a leaf partition (creating XMP sidecars), then
+            builds parent manifests bottom-up so every ancestor folder has an
+            aggregate manifest summarising its children.
+
+            Args:
+                root: Library root relative to the backend root.  Defaults to
+                    ``""`` (the entire backend).
+                force: Re-extract EXIF and overwrite existing XMP sidecars.
+
+            Returns:
+                Summary dict with ``partitionsIndexed``, ``totalPhotos``,
+                ``totalSidecarsCreated``, and ``totalErrors``.
+            """
+            result = await index_library(self.backend, root=root, force=force)
+            return {
+                "partitionsIndexed": len(result.partitions),
+                "totalPhotos": result.total_photos,
+                "totalSidecarsCreated": result.total_sidecars_created,
+                "totalErrors": result.total_errors,
             }
