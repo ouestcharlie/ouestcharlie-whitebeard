@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from email import generator
+from datetime import datetime
 from pathlib import PurePath
 from itertools import chain
 from typing import Generator
@@ -260,6 +260,16 @@ async def _build_parent_manifests(
         await manifest_store.rebuild_parent(parent_path, direct_children)
 
 
+def _naive(dt: datetime) -> datetime:
+    """Return a timezone-naive datetime for ordering.
+
+    Strips tzinfo so that min()/max() can compare a mix of aware and naive
+    datetimes without raising TypeError.  The original value (with or without
+    tzinfo) is preserved in the PartitionSummary; only the key is stripped.
+    """
+    return dt.replace(tzinfo=None)
+
+
 def _aggregate_summary(path: str, children: list[PartitionSummary]) -> PartitionSummary:
     """Aggregate child summaries into a single parent-level summary."""
     total = sum(c.photo_count for c in children)
@@ -268,8 +278,8 @@ def _aggregate_summary(path: str, children: list[PartitionSummary]) -> Partition
     return PartitionSummary(
         path=path,
         photo_count=total,
-        date_min=min(dates_min) if dates_min else None,
-        date_max=max(dates_max) if dates_max else None,
+        date_min=min(dates_min, key=_naive) if dates_min else None,
+        date_max=max(dates_max, key=_naive) if dates_max else None,
     )
 
 
@@ -344,8 +354,8 @@ def _compute_summary(partition: str, entries: list[PhotoEntry]) -> PartitionSumm
     return PartitionSummary(
         path=partition,
         photo_count=len(entries),
-        date_min=min(dates) if dates else None,
-        date_max=max(dates) if dates else None,
+        date_min=min(dates, key=_naive) if dates else None,
+        date_max=max(dates, key=_naive) if dates else None,
     )
 
 

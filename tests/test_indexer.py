@@ -6,6 +6,7 @@ import json
 import logging
 import shutil
 import tempfile
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -391,3 +392,46 @@ async def test_index_partition_logs_error_on_photo_failure(tmpdir: Path, caplog)
     assert any("simulated failure" in msg for msg in caplog.messages)
     assert any(r.levelno == logging.ERROR for r in caplog.records)
     assert any(r.exc_info is not None for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Mixed-timezone datetime handling
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_index_mixed_timezone_photos(tmpdir: Path) -> None:
+    """index_partition succeeds when photos have a mix of aware and naive datetimes.
+
+    Regression test: min()/max() over a mixed list raises TypeError without the
+    _naive() key function.
+    """
+    from datetime import timezone, timedelta
+    from ouestcharlie_toolkit.schema import XmpSidecar, VersionToken
+
+    naive_dt = datetime(2024, 7, 1, 12, 0, 0)
+    aware_dt = datetime(2024, 7, 2, 12, 0, 0, tzinfo=timezone(timedelta(hours=2)))
+
+    (tmpdir / "a.jpg").write_bytes(_MINIMAL_JPEG)
+    (tmpdir / "b.jpg").write_bytes(_MINIMAL_JPEG)
+    backend = LocalBackend(root=str(tmpdir))
+
+    call_count = 0
+
+    async def fake_process(xmp_store, photo_path, force):
+        nonlocal call_count
+        call_count += 1
+        dt = naive_dt if call_count == 1 else aware_dt
+        sidecar = XmpSidecar(content_hash=f"sha256:{'0' * 64}", date_taken=dt)
+        token = VersionToken(value=1)
+        from whitebeard.indexer import _sidecar_to_entry
+        entry = _sidecar_to_entry(photo_path.split("/")[-1], sidecar, sidecar.content_hash, str(token.value))
+        return entry, True
+
+    with patch("whitebeard.indexer._process_one", side_effect=fake_process):
+        result = await index_partition(backend, "")
+
+    assert result.errors == 0
+    assert result.summary is not None
+    assert result.summary.date_min is not None
+    assert result.summary.date_max is not None
