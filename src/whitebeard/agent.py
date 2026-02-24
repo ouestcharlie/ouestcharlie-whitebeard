@@ -81,4 +81,5 @@ class WhitebeardAgent(AgentBase):
                 "totalPhotos": result.total_photos,
                 "totalSidecarsCreated": result.total_sidecars_created,
                 "totalErrors": result.total_errors,
+                "errorDetails": result.error_details
             }

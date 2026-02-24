@@ -2,8 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
+from email import generator
 from pathlib import PurePath
+from itertools import chain
+from typing import Generator
+
+_log = logging.getLogger(__name__)
 
 from ouestcharlie_toolkit.backend import Backend
 from ouestcharlie_toolkit.manifest import ManifestStore
@@ -56,6 +62,10 @@ class LibraryIndexResult:
     @property
     def total_errors(self) -> int:
         return sum(r.errors for r in self.partitions)
+    
+    @property
+    def error_details(self) -> Generator[str]:
+        yield from chain.from_iterable(r.error_details for r in self.partitions)
 
 
 async def index_partition(
@@ -103,6 +113,10 @@ async def index_partition(
             else:
                 result.sidecars_skipped += 1
         except Exception as exc:
+            _log.error(
+                "Failed to process photo — partition=%r file=%r: %s",
+                partition, filename, exc, exc_info=True,
+            )
             result.errors += 1
             result.error_details.append(f"{filename}: {exc}")
 

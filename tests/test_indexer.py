@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -365,3 +367,27 @@ async def test_index_library_idempotent(tmpdir: Path) -> None:
     assert result2.total_photos == 1
     assert result2.total_sidecars_created == 0  # sidecar already exists
     assert result2.total_errors == 0
+
+
+# ---------------------------------------------------------------------------
+# Logging behaviour
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_index_partition_logs_error_on_photo_failure(tmpdir: Path, caplog) -> None:
+    """When _process_one raises, an ERROR with exc_info is logged."""
+    (tmpdir / "broken.jpg").write_bytes(_MINIMAL_JPEG)
+    backend = LocalBackend(root=str(tmpdir))
+
+    with patch(
+        "whitebeard.indexer._process_one",
+        side_effect=RuntimeError("simulated failure"),
+    ):
+        with caplog.at_level(logging.ERROR, logger="whitebeard.indexer"):
+            result = await index_partition(backend, "")
+
+    assert result.errors == 1
+    assert any("simulated failure" in msg for msg in caplog.messages)
+    assert any(r.levelno == logging.ERROR for r in caplog.records)
+    assert any(r.exc_info is not None for r in caplog.records)
