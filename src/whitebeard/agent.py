@@ -32,8 +32,10 @@ class WhitebeardAgent(AgentBase):
             each photo without an existing XMP sidecar (or all photos when
             ``force=True``), extracts EXIF metadata and writes an XMP sidecar
             containing ``ouestcharlie:contentHash`` and all standard EXIF
-            fields.  Finally creates or updates the partition's leaf manifest at
-            ``<partition>/.ouestcharlie/manifest.json``.
+            fields.  Creates or updates the leaf manifest at
+            ``<partition>/.ouestcharlie/manifest.json``, and generates
+            ``thumbnails.avif`` (256 px tiles) and ``previews.avif`` (1440 px
+            tiles) in the same metadata directory.
 
             Args:
                 partition: Folder path relative to the backend root, e.g.
@@ -42,8 +44,13 @@ class WhitebeardAgent(AgentBase):
                 force: Re-extract EXIF and overwrite existing XMP sidecars.
 
             Returns:
-                Summary dict with ``photosProcessed``, ``sidecarsCreated``,
-                ``sidecarsSkipped``, and ``errors``.
+                ``partition`` — echoed partition path.
+                ``photosProcessed`` — total photos found.
+                ``sidecarsCreated`` — XMP sidecars written (new or force-updated).
+                ``sidecarsSkipped`` — photos whose existing sidecar was reused.
+                ``thumbnailsRebuilt`` — true if AVIF grids were (re-)generated.
+                ``errors`` — count of photos that failed processing.
+                ``errorDetails`` — list of per-photo error messages.
             """
             result = await index_partition(
                 self.backend, partition, force=force, generate_thumbnails=True
@@ -55,6 +62,7 @@ class WhitebeardAgent(AgentBase):
                 "sidecarsSkipped": result.sidecars_skipped,
                 "thumbnailsRebuilt": result.thumbnails_rebuilt,
                 "errors": result.errors,
+                "errorDetails": result.error_details,
             }
 
         @mcp.tool()
@@ -65,9 +73,9 @@ class WhitebeardAgent(AgentBase):
             """Recursively index all photos in the library and build manifests.
 
             Walks every subfolder under ``root``, indexes each folder that
-            contains photos as a leaf partition (creating XMP sidecars), then
-            builds parent manifests bottom-up so every ancestor folder has an
-            aggregate manifest summarising its children.
+            contains photos as a leaf partition (creating XMP sidecars and AVIF
+            thumbnail grids), then builds parent manifests bottom-up so every
+            ancestor folder has an aggregate manifest summarising its children.
 
             Args:
                 root: Library root relative to the backend root.  Defaults to
@@ -75,14 +83,19 @@ class WhitebeardAgent(AgentBase):
                 force: Re-extract EXIF and overwrite existing XMP sidecars.
 
             Returns:
-                Summary dict with ``partitionsIndexed``, ``totalPhotos``,
-                ``totalSidecarsCreated``, and ``totalErrors``.
+                ``partitionsIndexed`` — number of leaf partitions processed.
+                ``totalPhotos`` — total photos across all partitions.
+                ``totalSidecarsCreated`` — XMP sidecars written.
+                ``totalThumbnailsRebuilt`` — partitions whose AVIF grids were regenerated.
+                ``totalErrors`` — count of photos that failed processing.
+                ``errorDetails`` — list of per-photo error messages across all partitions.
             """
             result = await index_library(self.backend, root=root, force=force, generate_thumbnails=True)
             return {
                 "partitionsIndexed": len(result.partitions),
                 "totalPhotos": result.total_photos,
                 "totalSidecarsCreated": result.total_sidecars_created,
+                "totalThumbnailsRebuilt": result.total_thumbnails_rebuilt,
                 "totalErrors": result.total_errors,
-                "errorDetails": result.error_details
+                "errorDetails": list(result.error_details),
             }

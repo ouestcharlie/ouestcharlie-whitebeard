@@ -69,7 +69,11 @@ class LibraryIndexResult:
     @property
     def total_errors(self) -> int:
         return sum(r.errors for r in self.partitions)
-    
+
+    @property
+    def total_thumbnails_rebuilt(self) -> int:
+        return sum(1 for r in self.partitions if r.thumbnails_rebuilt)
+
     @property
     def error_details(self) -> Generator[str]:
         yield from chain.from_iterable(r.error_details for r in self.partitions)
@@ -211,7 +215,7 @@ def _discover_leaf_partitions(files: list, root: str) -> set[str]:
     A partition is the immediate parent directory of a photo file.
     Paths inside metadata directories (METADATA_DIR) are excluded.
     """
-    _meta_segment = f"/{METADATA_DIR}/"
+    _meta_segment = f"{METADATA_DIR}/"
     leaf_partitions: set[str] = set()
     for f in files:
         if _meta_segment in f.path:
