@@ -359,12 +359,13 @@ requires-dist = [
     { name = "mcp", specifier = ">=1.0" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.0" },
     { name = "pillow", specifier = ">=10.0" },
+    { name = "pillow-heif", marker = "extra == 'heic'", specifier = ">=0.13" },
     { name = "pyexiv2", specifier = ">=2.8" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23" },
     { name = "rawpy", marker = "extra == 'raw'", specifier = ">=0.19" },
 ]
-provides-extras = ["raw", "dev"]
+provides-extras = ["raw", "heic", "dev"]
 
 [[package]]
 name = "packaging"

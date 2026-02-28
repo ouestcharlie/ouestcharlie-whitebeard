@@ -14,12 +14,18 @@ _log = logging.getLogger(__name__)
 from ouestcharlie_toolkit.backend import Backend
 from ouestcharlie_toolkit.manifest import ManifestStore
 from ouestcharlie_toolkit.schema import (
+    METADATA_DIR,
     SCHEMA_VERSION,
     LeafManifest,
     PartitionSummary,
     PhotoEntry,
     XmpSidecar,
 )
+
+# TYPE_CHECKING import for ThumbnailResult avoids circular imports at runtime.
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from ouestcharlie_toolkit.thumbnail_builder import ThumbnailResult
 from ouestcharlie_toolkit.xmp import XmpStore
 
 
@@ -43,6 +49,7 @@ class IndexResult:
     errors: int = 0
     error_details: list[str] = field(default_factory=list)
     summary: PartitionSummary | None = None
+    thumbnails_rebuilt: bool = False
 
 
 @dataclass
@@ -72,6 +79,7 @@ async def index_partition(
     backend: Backend,
     partition: str,
     force: bool = False,
+    generate_thumbnails: bool = False,
 ) -> IndexResult:
     """Index all photos in a partition (index mode — files stay in place).
 
@@ -88,6 +96,9 @@ async def index_partition(
         partition: Folder path relative to backend root (e.g. "" for root,
             "Vacations/Italy 2023/" for a subfolder). Trailing slash optional.
         force: If True, re-extract EXIF and overwrite existing XMP sidecars.
+        generate_thumbnails: If True, generate thumbnail and preview AVIF
+            containers after indexing.  Requires the avif-grid binary.
+            Defaults to False; the MCP agent sets this to True.
 
     Returns:
         IndexResult with counts of processed, created, skipped, and failed photos.
@@ -120,8 +131,25 @@ async def index_partition(
             result.errors += 1
             result.error_details.append(f"{filename}: {exc}")
 
+    # Generate thumbnail and preview AVIF containers.
+    thumbnail_result = None
+    if generate_thumbnails and photo_entries:
+        try:
+            from ouestcharlie_toolkit.thumbnail_builder import generate_partition_thumbnails
+            thumbnail_result = await generate_partition_thumbnails(backend, partition, photo_entries)
+            result.thumbnails_rebuilt = True
+        except Exception as exc:
+            _log.error(
+                "Thumbnail generation failed — partition=%r: %s",
+                partition, exc, exc_info=True,
+            )
+            result.errors += 1
+            result.error_details.append(f"thumbnails: {exc}")
+
     # Build or update the leaf manifest.
-    result.summary = await _upsert_leaf_manifest(manifest_store, partition, photo_entries)
+    result.summary = await _upsert_leaf_manifest(
+        manifest_store, partition, photo_entries, thumbnail_result
+    )
 
     return result
 
@@ -130,6 +158,7 @@ async def index_library(
     backend: Backend,
     root: str = "",
     force: bool = False,
+    generate_thumbnails: bool = False,
 ) -> LibraryIndexResult:
     """Recursively index all photos in a library and build hierarchical manifests.
 
@@ -142,6 +171,8 @@ async def index_library(
         root: Library root relative to the backend root (e.g. "" for the full
             backend, "Vacations/" to scope to a subfolder).
         force: If True, re-extract EXIF and overwrite existing XMP sidecars.
+        generate_thumbnails: If True, generate thumbnail AVIF containers for
+            each partition.  Passed through to ``index_partition``.
 
     Returns:
         LibraryIndexResult aggregating every per-partition IndexResult.
@@ -156,7 +187,9 @@ async def index_library(
     # Index each leaf partition, collecting summaries.
     leaf_summaries: dict[str, PartitionSummary] = {}
     for partition in sorted(leaf_partitions):
-        partition_result = await index_partition(backend, partition, force)
+        partition_result = await index_partition(
+            backend, partition, force, generate_thumbnails=generate_thumbnails
+        )
         library_result.partitions.append(partition_result)
         if partition_result.summary is not None:
             leaf_summaries[partition] = partition_result.summary
@@ -176,9 +209,13 @@ def _discover_leaf_partitions(files: list, root: str) -> set[str]:
     """Return the set of unique partition paths that directly contain photos.
 
     A partition is the immediate parent directory of a photo file.
+    Paths inside metadata directories (METADATA_DIR) are excluded.
     """
+    _meta_segment = f"/{METADATA_DIR}/"
     leaf_partitions: set[str] = set()
     for f in files:
+        if _meta_segment in f.path:
+            continue
         if PurePath(f.path).suffix.lower() not in PHOTO_EXTENSIONS:
             continue
         slash_pos = f.path.rfind("/")
@@ -363,6 +400,7 @@ async def _upsert_leaf_manifest(
     manifest_store: ManifestStore,
     partition: str,
     photo_entries: list[PhotoEntry],
+    thumbnail_result: "ThumbnailResult | None" = None,
 ) -> PartitionSummary:
     """Create or update the leaf manifest for the partition.
 
@@ -376,9 +414,20 @@ async def _upsert_leaf_manifest(
         photos=photo_entries,
         summary=summary,
     )
+    if thumbnail_result is not None:
+        manifest.thumbnails_hash = thumbnail_result.thumbnails_hash
+        manifest.previews_hash = thumbnail_result.previews_hash
+        manifest.thumbnail_grid = thumbnail_result.thumbnail_grid
+        manifest.preview_grid = thumbnail_result.preview_grid
     try:
         existing, version = await manifest_store.read_leaf(partition)
         manifest._extra = existing._extra  # preserve unknown fields
+        # Preserve existing thumbnail hashes if we didn't regenerate thumbnails.
+        if thumbnail_result is None:
+            manifest.thumbnails_hash = existing.thumbnails_hash
+            manifest.previews_hash = existing.previews_hash
+            manifest.thumbnail_grid = existing.thumbnail_grid
+            manifest.preview_grid = existing.preview_grid
         await manifest_store.write_leaf(manifest, version)
     except FileNotFoundError:
         await manifest_store.create_leaf(manifest)

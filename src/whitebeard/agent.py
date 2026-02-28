@@ -45,12 +45,15 @@ class WhitebeardAgent(AgentBase):
                 Summary dict with ``photosProcessed``, ``sidecarsCreated``,
                 ``sidecarsSkipped``, and ``errors``.
             """
-            result = await index_partition(self.backend, partition, force=force)
+            result = await index_partition(
+                self.backend, partition, force=force, generate_thumbnails=True
+            )
             return {
                 "partition": result.partition,
                 "photosProcessed": result.photos_processed,
                 "sidecarsCreated": result.sidecars_created,
                 "sidecarsSkipped": result.sidecars_skipped,
+                "thumbnailsRebuilt": result.thumbnails_rebuilt,
                 "errors": result.errors,
             }
 
@@ -75,7 +78,7 @@ class WhitebeardAgent(AgentBase):
                 Summary dict with ``partitionsIndexed``, ``totalPhotos``,
                 ``totalSidecarsCreated``, and ``totalErrors``.
             """
-            result = await index_library(self.backend, root=root, force=force)
+            result = await index_library(self.backend, root=root, force=force, generate_thumbnails=True)
             return {
                 "partitionsIndexed": len(result.partitions),
                 "totalPhotos": result.total_photos,
