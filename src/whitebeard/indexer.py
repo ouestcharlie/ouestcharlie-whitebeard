@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import PurePath
@@ -163,6 +164,7 @@ async def index_library(
     root: str = "",
     force: bool = False,
     generate_thumbnails: bool = False,
+    on_progress: Callable[[int, int, str], Awaitable[None]] | None = None,
 ) -> LibraryIndexResult:
     """Recursively index all photos in a library and build hierarchical manifests.
 
@@ -190,7 +192,11 @@ async def index_library(
 
     # Index each leaf partition, collecting summaries.
     leaf_summaries: dict[str, PartitionSummary] = {}
-    for partition in sorted(leaf_partitions):
+    sorted_partitions = sorted(leaf_partitions)
+    total_partitions = len(sorted_partitions)
+    for i, partition in enumerate(sorted_partitions):
+        if on_progress is not None:
+            await on_progress(i, total_partitions, partition)
         partition_result = await index_partition(
             backend, partition, force, generate_thumbnails=generate_thumbnails
         )
@@ -199,6 +205,8 @@ async def index_library(
             leaf_summaries[partition] = partition_result.summary
 
     # Build parent manifests bottom-up.
+    if on_progress is not None:
+        await on_progress(total_partitions, total_partitions, "building manifests")
     await _build_parent_manifests(manifest_store, leaf_summaries, root)
 
     return library_result
@@ -316,11 +324,15 @@ def _aggregate_summary(path: str, children: list[PartitionSummary]) -> Partition
     total = sum(c.photo_count for c in children)
     dates_min = [c.date_min for c in children if c.date_min is not None]
     dates_max = [c.date_max for c in children if c.date_max is not None]
+    rating_mins = [c.rating_min for c in children if c.rating_min is not None]
+    rating_maxes = [c.rating_max for c in children if c.rating_max is not None]
     return PartitionSummary(
         path=path,
         photo_count=total,
         date_min=min(dates_min, key=_naive) if dates_min else None,
         date_max=max(dates_max, key=_naive) if dates_max else None,
+        rating_min=min(rating_mins) if rating_mins else None,
+        rating_max=max(rating_maxes) if rating_maxes else None,
     )
 
 
@@ -372,18 +384,18 @@ def _sidecar_to_entry(
     xmp_version_token: str,
 ) -> PhotoEntry:
     """Convert an XmpSidecar to a PhotoEntry for the leaf manifest."""
-    camera: str | None = None
-    parts = [p for p in [sidecar.camera_make, sidecar.camera_model] if p]
-    if parts:
-        camera = " ".join(parts)
     return PhotoEntry(
         filename=filename,
         content_hash=content_hash,
         date_taken=sidecar.date_taken,
-        camera=camera,
+        make=sidecar.camera_make,
+        model=sidecar.camera_model,
         gps=sidecar.gps,
         orientation=sidecar.orientation,
         tags=list(sidecar.tags),
+        rating=sidecar.rating,
+        width=sidecar.width,
+        height=sidecar.height,
         metadata_version=sidecar.metadata_version,
         xmp_version_token=xmp_version_token,
     )
@@ -392,11 +404,14 @@ def _sidecar_to_entry(
 def _compute_summary(partition: str, entries: list[PhotoEntry]) -> PartitionSummary:
     """Compute partition-level summary statistics from photo entries."""
     dates = [e.date_taken for e in entries if e.date_taken is not None]
+    ratings = [e.rating for e in entries if e.rating is not None]
     return PartitionSummary(
         path=partition,
         photo_count=len(entries),
         date_min=min(dates, key=_naive) if dates else None,
         date_max=max(dates, key=_naive) if dates else None,
+        rating_min=min(ratings) if ratings else None,
+        rating_max=max(ratings) if ratings else None,
     )
 
 

@@ -138,6 +138,53 @@ async def test_index_manifest_has_date(backend_with_sample: LocalBackend, tmpdir
     assert "dateMax" in data["summary"]
 
 
+@pytest.mark.asyncio
+async def test_index_manifest_summary_rating_range(tmpdir: Path) -> None:
+    """Leaf manifest summary has ratingMin/ratingMax when photos have ratings."""
+    from ouestcharlie_toolkit.schema import XmpSidecar, VersionToken
+    from whitebeard.indexer import _sidecar_to_entry
+
+    (tmpdir / "a.jpg").write_bytes(_MINIMAL_JPEG)
+    (tmpdir / "b.jpg").write_bytes(_MINIMAL_JPEG)
+    (tmpdir / "c.jpg").write_bytes(_MINIMAL_JPEG)
+    backend = LocalBackend(root=str(tmpdir))
+
+    ratings = [2, 5, 4]
+    call_count = 0
+
+    async def fake_process(xmp_store, photo_path, force):
+        nonlocal call_count
+        r = ratings[call_count]
+        call_count += 1
+        sidecar = XmpSidecar(content_hash=f"sha256:{'0' * 63}{call_count}", rating=r)
+        entry = _sidecar_to_entry(photo_path.split("/")[-1], sidecar, sidecar.content_hash, "1")
+        return entry, True
+
+    with patch("whitebeard.indexer._process_one", side_effect=fake_process):
+        result = await index_partition(backend, "")
+
+    assert result.summary is not None
+    assert result.summary.rating_min == 2
+    assert result.summary.rating_max == 5
+
+    data = json.loads((tmpdir / METADATA_DIR / "manifest.json").read_text())
+    assert data["summary"]["ratingMin"] == 2
+    assert data["summary"]["ratingMax"] == 5
+
+
+@pytest.mark.asyncio
+async def test_index_manifest_summary_no_rating_when_unrated(tmpdir: Path) -> None:
+    """ratingMin/ratingMax are absent from the summary when no photo has a rating."""
+    (tmpdir / "photo.jpg").write_bytes(_MINIMAL_JPEG)
+    backend = LocalBackend(root=str(tmpdir))
+
+    await index_partition(backend, "")
+
+    data = json.loads((tmpdir / METADATA_DIR / "manifest.json").read_text())
+    assert "ratingMin" not in data["summary"]
+    assert "ratingMax" not in data["summary"]
+
+
 # ---------------------------------------------------------------------------
 # index_partition — skip / force behaviour
 # ---------------------------------------------------------------------------
@@ -320,6 +367,49 @@ async def test_index_library_three_levels(tmpdir: Path) -> None:
     assert (tmpdir / "2024" / METADATA_DIR / "manifest.json").exists()
     # Root parent.
     assert (tmpdir / METADATA_DIR / "manifest.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_index_library_parent_rating_range(tmpdir: Path) -> None:
+    """Parent manifest ratingMin/ratingMax aggregate across child partitions."""
+    from ouestcharlie_toolkit.schema import XmpSidecar, VersionToken
+    from whitebeard.indexer import _sidecar_to_entry
+    from ouestcharlie_toolkit.xmp import serialize_xmp
+
+    # Partition A: photos rated 2 and 4 → ratingMin=2, ratingMax=4
+    (tmpdir / "A").mkdir()
+    (tmpdir / "A" / "p1.jpg").write_bytes(_MINIMAL_JPEG)
+    (tmpdir / "A" / "p2.jpg").write_bytes(_MINIMAL_JPEG)
+    # Partition B: photo rated 5 → ratingMin=5, ratingMax=5
+    (tmpdir / "B").mkdir()
+    (tmpdir / "B" / "p3.jpg").write_bytes(_MINIMAL_JPEG)
+    backend = LocalBackend(root=str(tmpdir))
+
+    # Write XMP sidecars with known ratings before indexing.
+    for photo, rating in [("A/p1.jpg", 2), ("A/p2.jpg", 4), ("B/p3.jpg", 5)]:
+        sidecar = XmpSidecar(
+            content_hash=f"sha256:{'0' * 63}{rating}",
+            rating=rating,
+        )
+        xmp_path = tmpdir / photo.replace(".jpg", ".xmp")
+        xmp_path.write_text(serialize_xmp(sidecar), encoding="utf-8")
+
+    await index_library(backend)
+
+    root_data = json.loads((tmpdir / METADATA_DIR / "manifest.json").read_text())
+    child_a = next(c for c in root_data["children"] if c["path"] == "A")
+    child_b = next(c for c in root_data["children"] if c["path"] == "B")
+
+    assert child_a["ratingMin"] == 2
+    assert child_a["ratingMax"] == 4
+    assert child_b["ratingMin"] == 5
+    assert child_b["ratingMax"] == 5
+
+    # Root-level aggregation: min/max across all children entries.
+    all_mins = [c["ratingMin"] for c in root_data["children"] if "ratingMin" in c]
+    all_maxes = [c["ratingMax"] for c in root_data["children"] if "ratingMax" in c]
+    assert min(all_mins) == 2
+    assert max(all_maxes) == 5
 
 
 @pytest.mark.asyncio

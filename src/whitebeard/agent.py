@@ -2,6 +2,12 @@
 
 from __future__ import annotations
 
+import logging
+
+from mcp.server.fastmcp import Context
+
+_log = logging.getLogger(__name__)
+
 from ouestcharlie_toolkit.server import AgentBase
 
 from .indexer import index_library, index_partition
@@ -23,6 +29,7 @@ class WhitebeardAgent(AgentBase):
 
         @mcp.tool()
         async def index_partition_tool(
+            ctx: Context,
             partition: str,
             force: bool = False,
         ) -> dict:
@@ -53,7 +60,7 @@ class WhitebeardAgent(AgentBase):
                 ``errorDetails`` — list of per-photo error messages.
             """
             result = await index_partition(
-                self.backend, partition, force=force, generate_thumbnails=True
+                self.backend, partition, force=force, generate_thumbnails=True,
             )
             return {
                 "partition": result.partition,
@@ -67,6 +74,7 @@ class WhitebeardAgent(AgentBase):
 
         @mcp.tool()
         async def index_library_tool(
+            ctx: Context,
             root: str = "",
             force: bool = False,
         ) -> dict:
@@ -90,7 +98,16 @@ class WhitebeardAgent(AgentBase):
                 ``totalErrors`` — count of photos that failed processing.
                 ``errorDetails`` — list of per-photo error messages across all partitions.
             """
-            result = await index_library(self.backend, root=root, force=force, generate_thumbnails=True)
+            async def _library_progress(current: int, total: int, name: str) -> None:
+                try:
+                    await ctx.report_progress(progress=current, total=total, message=name)
+                except Exception as exc:
+                    _log.debug("Progress notification failed (client may have disconnected): %s", exc)
+
+            result = await index_library(
+                self.backend, root=root, force=force, generate_thumbnails=True,
+                on_progress=_library_progress,
+            )
             return {
                 "partitionsIndexed": len(result.partitions),
                 "totalPhotos": result.total_photos,

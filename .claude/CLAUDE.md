@@ -4,6 +4,12 @@
 
 Never use `python`, `python3`, or `uv run pytest` — same reasons as py-toolkit.
 
+## MCP Error Handling
+
+- **Always log exceptions** in MCP tool handlers — FastMCP swallows unhandled errors silently, so without explicit logging they are invisible.
+- Wrap `ctx.report_progress()` calls in `try/except` and log failures at DEBUG level. The MCP client may disconnect or time out while the tool is still running; a failed progress notification must never abort the operation.
+- For long-running tools, the MCP Inspector timeout must be increased in its settings (default is too low for full-library indexing).
+
 ## Key Design Rules
 
 - `indexer.py` is **pure async logic** with no MCP dependency — easy to unit test.
