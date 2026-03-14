@@ -32,6 +32,8 @@ class WhitebeardAgent(AgentBase):
             ctx: Context,
             partition: str,
             force: bool = False,
+            generate_thumbnails: bool = True,
+            extract_exif: bool = True,
         ) -> dict:
             """Index all photos directly in a partition folder.
 
@@ -49,6 +51,12 @@ class WhitebeardAgent(AgentBase):
                     ``""`` for the root, ``"Vacations/Italy 2023/"`` for a
                     sub-folder.  Trailing slash is optional.
                 force: Re-extract EXIF and overwrite existing XMP sidecars.
+                generate_thumbnails: Generate ``thumbnails.avif`` and
+                    ``previews.avif`` AVIF grids.  Defaults to True.
+                extract_exif: Extract EXIF and create/update XMP sidecars.
+                    Set to False to skip EXIF extraction and only rebuild the
+                    manifest from existing sidecars.  Cannot be combined with
+                    ``force``.  Defaults to True.
 
             Returns:
                 ``partition`` — echoed partition path.
@@ -60,7 +68,9 @@ class WhitebeardAgent(AgentBase):
                 ``errorDetails`` — list of per-photo error messages.
             """
             result = await index_partition(
-                self.backend, partition, force=force, generate_thumbnails=True,
+                self.backend, partition, force=force,
+                generate_thumbnails=generate_thumbnails,
+                extract_exif=extract_exif,
             )
             return {
                 "partition": result.partition,
@@ -77,6 +87,8 @@ class WhitebeardAgent(AgentBase):
             ctx: Context,
             root: str = "",
             force: bool = False,
+            generate_thumbnails: bool = True,
+            extract_exif: bool = True,
         ) -> dict:
             """Recursively index all photos in the library and build manifests.
 
@@ -89,6 +101,13 @@ class WhitebeardAgent(AgentBase):
                 root: Library root relative to the backend root.  Defaults to
                     ``""`` (the entire backend).
                 force: Re-extract EXIF and overwrite existing XMP sidecars.
+                generate_thumbnails: Generate ``thumbnails.avif`` and
+                    ``previews.avif`` AVIF grids for each partition.  Defaults
+                    to True.
+                extract_exif: Extract EXIF and create/update XMP sidecars.
+                    Set to False to skip EXIF extraction and only rebuild
+                    manifests from existing sidecars.  Cannot be combined with
+                    ``force``.  Defaults to True.
 
             Returns:
                 ``partitionsIndexed`` — number of leaf partitions processed.
@@ -105,7 +124,9 @@ class WhitebeardAgent(AgentBase):
                     _log.debug("Progress notification failed (client may have disconnected): %s", exc)
 
             result = await index_library(
-                self.backend, root=root, force=force, generate_thumbnails=True,
+                self.backend, root=root, force=force,
+                generate_thumbnails=generate_thumbnails,
+                extract_exif=extract_exif,
                 on_progress=_library_progress,
             )
             return {
