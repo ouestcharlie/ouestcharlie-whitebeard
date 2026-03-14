@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -52,6 +53,7 @@ class IndexResult:
     error_details: list[str] = field(default_factory=list)
     summary: PartitionSummary | None = None
     thumbnails_rebuilt: bool = False
+    duration_ms: int = 0
 
 
 @dataclass
@@ -75,6 +77,10 @@ class LibraryIndexResult:
     @property
     def total_thumbnails_rebuilt(self) -> int:
         return sum(1 for r in self.partitions if r.thumbnails_rebuilt)
+
+    @property
+    def total_duration_ms(self) -> int:
+        return sum(r.duration_ms for r in self.partitions)
 
     @property
     def error_details(self) -> Generator[str]:
@@ -113,6 +119,7 @@ async def index_partition(
     Returns:
         IndexResult with counts of processed, created, skipped, and failed photos.
     """
+    _t0 = time.monotonic()
     result = IndexResult(partition=partition)
     xmp_store = XmpStore(backend)
     manifest_store = ManifestStore(backend)
@@ -173,6 +180,7 @@ async def index_partition(
         manifest_store, partition, photo_entries, thumbnail_result
     )
 
+    result.duration_ms = round((time.monotonic() - _t0) * 1000)
     return result
 
 

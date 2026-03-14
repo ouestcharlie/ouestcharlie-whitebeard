@@ -66,6 +66,7 @@ class WhitebeardAgent(AgentBase):
                 ``thumbnailsRebuilt`` — true if AVIF grids were (re-)generated.
                 ``errors`` — count of photos that failed processing.
                 ``errorDetails`` — list of per-photo error messages.
+                ``durationMs`` — wall-clock time for this partition in milliseconds.
             """
             result = await index_partition(
                 self.backend, partition, force=force,
@@ -80,6 +81,7 @@ class WhitebeardAgent(AgentBase):
                 "thumbnailsRebuilt": result.thumbnails_rebuilt,
                 "errors": result.errors,
                 "errorDetails": result.error_details,
+                "durationMs": result.duration_ms,
             }
 
         @mcp.tool()
@@ -116,6 +118,7 @@ class WhitebeardAgent(AgentBase):
                 ``totalThumbnailsRebuilt`` — partitions whose AVIF grids were regenerated.
                 ``totalErrors`` — count of photos that failed processing.
                 ``errorDetails`` — list of per-photo error messages across all partitions.
+                ``totalDurationMs`` — sum of per-partition wall-clock times in milliseconds.
             """
             async def _library_progress(current: int, total: int, name: str) -> None:
                 try:
@@ -136,4 +139,5 @@ class WhitebeardAgent(AgentBase):
                 "totalThumbnailsRebuilt": result.total_thumbnails_rebuilt,
                 "totalErrors": result.total_errors,
                 "errorDetails": list(result.error_details),
+                "totalDurationMs": result.total_duration_ms,
             }

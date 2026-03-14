@@ -160,7 +160,7 @@ async def test_index_manifest_summary_rating_range(tmpdir: Path) -> None:
         entry = _sidecar_to_entry(photo_path.split("/")[-1], sidecar, sidecar.content_hash, "1")
         return entry, True
 
-    with patch("whitebeard.indexer._process_one", side_effect=fake_process):
+    with patch("whitebeard.indexer._extract_one", side_effect=fake_process):
         result = await index_partition(backend, "")
 
     assert result.summary is not None
@@ -564,7 +564,7 @@ async def test_index_partition_logs_error_on_photo_failure(tmpdir: Path, caplog)
     backend = LocalBackend(root=str(tmpdir))
 
     with patch(
-        "whitebeard.indexer._process_one",
+        "whitebeard.indexer._extract_one",
         side_effect=RuntimeError("simulated failure"),
     ):
         with caplog.at_level(logging.ERROR, logger="whitebeard.indexer"):
@@ -610,10 +610,38 @@ async def test_index_mixed_timezone_photos(tmpdir: Path) -> None:
         entry = _sidecar_to_entry(photo_path.split("/")[-1], sidecar, sidecar.content_hash, str(token.value))
         return entry, True
 
-    with patch("whitebeard.indexer._process_one", side_effect=fake_process):
+    with patch("whitebeard.indexer._extract_one", side_effect=fake_process):
         result = await index_partition(backend, "")
 
     assert result.errors == 0
     assert result.summary is not None
     assert result.summary.date_min is not None
     assert result.summary.date_max is not None
+
+
+# ---------------------------------------------------------------------------
+# Timing
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_index_partition_duration_ms(backend_with_sample: LocalBackend) -> None:
+    """IndexResult.duration_ms is a non-negative integer after indexing."""
+    result = await index_partition(backend_with_sample, "")
+    assert isinstance(result.duration_ms, int)
+    assert result.duration_ms >= 0
+
+
+@pytest.mark.asyncio
+async def test_index_library_total_duration_ms(tmpdir: Path) -> None:
+    """LibraryIndexResult.total_duration_ms sums durations across partitions."""
+    (tmpdir / "A").mkdir()
+    (tmpdir / "B").mkdir()
+    (tmpdir / "A" / "p1.jpg").write_bytes(_MINIMAL_JPEG)
+    (tmpdir / "B" / "p2.jpg").write_bytes(_MINIMAL_JPEG)
+    backend = LocalBackend(root=str(tmpdir))
+
+    result = await index_library(backend)
+
+    assert result.total_duration_ms == sum(p.duration_ms for p in result.partitions)
+    assert result.total_duration_ms >= 0
