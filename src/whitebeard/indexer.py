@@ -357,22 +357,20 @@ def _aggregate_summary(
     """Aggregate child summaries into a single parent-level summary."""
     if field_config is None:
         field_config = PHOTO_FIELDS
-    kwargs: dict = {
-        "path": path,
-        "photo_count": sum(c.photo_count for c in children),
-    }
+    stats: dict = {}
     for fdef in field_config:
-        if fdef.summary_min_attr is None or fdef.summary_max_attr is None:
+        if not fdef.summary_range:
             continue
-        mins  = [v for c in children if (v := getattr(c, fdef.summary_min_attr, None)) is not None]
-        maxes = [v for c in children if (v := getattr(c, fdef.summary_max_attr, None)) is not None]
+        child_stats = [s for c in children if (s := c._stats.get(fdef.name)) is not None]
+        mins  = [s["min"]  for s in child_stats if s.get("min")  is not None]
+        maxes = [s["max"] for s in child_stats if s.get("max") is not None]
+        if not mins and not maxes:
+            continue
         if fdef.type == FieldType.DATE_RANGE:
-            kwargs[fdef.summary_min_attr] = min(mins,  key=_naive) if mins  else None
-            kwargs[fdef.summary_max_attr] = max(maxes, key=_naive) if maxes else None
+            stats[fdef.name] = {"type": "date_range", "min": min(mins, key=_naive) if mins else None, "max": max(maxes, key=_naive) if maxes else None}
         elif fdef.type == FieldType.INT_RANGE:
-            kwargs[fdef.summary_min_attr] = min(mins)  if mins  else None
-            kwargs[fdef.summary_max_attr] = max(maxes) if maxes else None
-    return PartitionSummary(**kwargs)
+            stats[fdef.name] = {"type": "int_range", "min": min(mins) if mins else None, "max": max(maxes) if maxes else None}
+    return PartitionSummary(path=path, photo_count=sum(c.photo_count for c in children), _stats=stats)
 
 
 # ---------------------------------------------------------------------------
@@ -468,18 +466,18 @@ def _compute_summary(
     """Compute partition-level summary statistics from photo entries."""
     if field_config is None:
         field_config = PHOTO_FIELDS
-    kwargs: dict = {"path": partition, "photo_count": len(entries)}
+    stats: dict = {}
     for fdef in field_config:
-        if fdef.summary_min_attr is None or fdef.summary_max_attr is None:
+        if not fdef.summary_range:
             continue
         values = [v for e in entries if (v := getattr(e, fdef.entry_attr, None)) is not None]
+        if not values:
+            continue
         if fdef.type == FieldType.DATE_RANGE:
-            kwargs[fdef.summary_min_attr] = min(values, key=_naive) if values else None
-            kwargs[fdef.summary_max_attr] = max(values, key=_naive) if values else None
+            stats[fdef.name] = {"type": "date_range", "min": min(values, key=_naive), "max": max(values, key=_naive)}
         elif fdef.type == FieldType.INT_RANGE:
-            kwargs[fdef.summary_min_attr] = min(values) if values else None
-            kwargs[fdef.summary_max_attr] = max(values) if values else None
-    return PartitionSummary(**kwargs)
+            stats[fdef.name] = {"type": "int_range", "min": min(values), "max": max(values)}
+    return PartitionSummary(path=partition, photo_count=len(entries), _stats=stats)
 
 
 async def _upsert_leaf_manifest(

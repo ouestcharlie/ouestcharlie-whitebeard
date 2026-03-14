@@ -130,12 +130,13 @@ async def test_index_manifest_summary(backend_with_sample: LocalBackend, tmpdir:
 
 @pytest.mark.asyncio
 async def test_index_manifest_has_date(backend_with_sample: LocalBackend, tmpdir: Path) -> None:
-    """The manifest summary has dateMin/dateMax when the photo has EXIF date."""
+    """The manifest summary has a date range when the photo has EXIF date."""
     await index_partition(backend_with_sample, "")
     data = json.loads((tmpdir / METADATA_DIR / "manifest.json").read_text())
     # 001.jpg has EXIF DateTimeOriginal
-    assert "dateMin" in data["summary"]
-    assert "dateMax" in data["summary"]
+    assert "date" in data["summary"]
+    assert "min" in data["summary"]["date"]
+    assert "max" in data["summary"]["date"]
 
 
 @pytest.mark.asyncio
@@ -164,12 +165,12 @@ async def test_index_manifest_summary_rating_range(tmpdir: Path) -> None:
         result = await index_partition(backend, "")
 
     assert result.summary is not None
-    assert result.summary.rating_min == 2
-    assert result.summary.rating_max == 5
+    assert result.summary.rating["min"] == 2
+    assert result.summary.rating["max"] == 5
 
     data = json.loads((tmpdir / METADATA_DIR / "manifest.json").read_text())
-    assert data["summary"]["ratingMin"] == 2
-    assert data["summary"]["ratingMax"] == 5
+    assert data["summary"]["rating"]["min"] == 2
+    assert data["summary"]["rating"]["max"] == 5
 
 
 @pytest.mark.asyncio
@@ -400,14 +401,14 @@ async def test_index_library_parent_rating_range(tmpdir: Path) -> None:
     child_a = next(c for c in root_data["children"] if c["path"] == "A")
     child_b = next(c for c in root_data["children"] if c["path"] == "B")
 
-    assert child_a["ratingMin"] == 2
-    assert child_a["ratingMax"] == 4
-    assert child_b["ratingMin"] == 5
-    assert child_b["ratingMax"] == 5
+    assert child_a["rating"]["min"] == 2
+    assert child_a["rating"]["max"] == 4
+    assert child_b["rating"]["min"] == 5
+    assert child_b["rating"]["max"] == 5
 
     # Root-level aggregation: min/max across all children entries.
-    all_mins = [c["ratingMin"] for c in root_data["children"] if "ratingMin" in c]
-    all_maxes = [c["ratingMax"] for c in root_data["children"] if "ratingMax" in c]
+    all_mins = [c["rating"]["min"] for c in root_data["children"] if "rating" in c]
+    all_maxes = [c["rating"]["max"] for c in root_data["children"] if "rating" in c]
     assert min(all_mins) == 2
     assert max(all_maxes) == 5
 
@@ -615,8 +616,9 @@ async def test_index_mixed_timezone_photos(tmpdir: Path) -> None:
 
     assert result.errors == 0
     assert result.summary is not None
-    assert result.summary.date_min is not None
-    assert result.summary.date_max is not None
+    assert result.summary.date is not None
+    assert result.summary.date["min"] is not None
+    assert result.summary.date["max"] is not None
 
 
 # ---------------------------------------------------------------------------
