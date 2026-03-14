@@ -359,17 +359,28 @@ def _aggregate_summary(
         field_config = PHOTO_FIELDS
     stats: dict = {}
     for fdef in field_config:
-        if not fdef.summary_range:
-            continue
-        child_stats = [s for c in children if (s := c._stats.get(fdef.name)) is not None]
-        mins  = [s["min"]  for s in child_stats if s.get("min")  is not None]
-        maxes = [s["max"] for s in child_stats if s.get("max") is not None]
-        if not mins and not maxes:
-            continue
-        if fdef.type == FieldType.DATE_RANGE:
-            stats[fdef.name] = {"type": "date_range", "min": min(mins, key=_naive) if mins else None, "max": max(maxes, key=_naive) if maxes else None}
-        elif fdef.type == FieldType.INT_RANGE:
-            stats[fdef.name] = {"type": "int_range", "min": min(mins) if mins else None, "max": max(maxes) if maxes else None}
+        if fdef.summary_range:
+            child_stats = [s for c in children if (s := c._stats.get(fdef.name)) is not None]
+            mins  = [s["min"]  for s in child_stats if s.get("min")  is not None]
+            maxes = [s["max"] for s in child_stats if s.get("max") is not None]
+            if not mins and not maxes:
+                continue
+            if fdef.type == FieldType.DATE_RANGE:
+                stats[fdef.name] = {"type": "date_range", "min": min(mins, key=_naive) if mins else None, "max": max(maxes, key=_naive) if maxes else None}
+            elif fdef.type == FieldType.INT_RANGE:
+                stats[fdef.name] = {"type": "int_range", "min": min(mins) if mins else None, "max": max(maxes) if maxes else None}
+        elif fdef.summary_gps_bbox and fdef.type is FieldType.GPS_BOX:
+            child_stats = [s for c in children if (s := c._stats.get(fdef.name)) is not None]
+            min_lats = [s["minLat"] for s in child_stats if s.get("minLat") is not None]
+            max_lats = [s["maxLat"] for s in child_stats if s.get("maxLat") is not None]
+            min_lons = [s["minLon"] for s in child_stats if s.get("minLon") is not None]
+            max_lons = [s["maxLon"] for s in child_stats if s.get("maxLon") is not None]
+            if min_lats:
+                stats[fdef.name] = {
+                    "type": "gps_bbox",
+                    "minLat": min(min_lats), "maxLat": max(max_lats),
+                    "minLon": min(min_lons), "maxLon": max(max_lons),
+                }
     return PartitionSummary(path=path, photo_count=sum(c.photo_count for c in children), _stats=stats)
 
 
@@ -467,15 +478,24 @@ def _compute_summary(
         field_config = PHOTO_FIELDS
     stats: dict = {}
     for fdef in field_config:
-        if not fdef.summary_range:
-            continue
-        values = [v for e in entries if (v := e.searchable.get(fdef.entry_attr)) is not None]
-        if not values:
-            continue
-        if fdef.type == FieldType.DATE_RANGE:
-            stats[fdef.name] = {"type": "date_range", "min": min(values, key=_naive), "max": max(values, key=_naive)}
-        elif fdef.type == FieldType.INT_RANGE:
-            stats[fdef.name] = {"type": "int_range", "min": min(values), "max": max(values)}
+        if fdef.summary_range:
+            values = [v for e in entries if (v := e.searchable.get(fdef.entry_attr)) is not None]
+            if not values:
+                continue
+            if fdef.type == FieldType.DATE_RANGE:
+                stats[fdef.name] = {"type": "date_range", "min": min(values, key=_naive), "max": max(values, key=_naive)}
+            elif fdef.type == FieldType.INT_RANGE:
+                stats[fdef.name] = {"type": "int_range", "min": min(values), "max": max(values)}
+        elif fdef.summary_gps_bbox and fdef.type is FieldType.GPS_BOX:
+            values = [v for e in entries if (v := e.searchable.get(fdef.entry_attr)) is not None]
+            if values:
+                lats = [v[0] for v in values]
+                lons = [v[1] for v in values]
+                stats[fdef.name] = {
+                    "type": "gps_bbox",
+                    "minLat": min(lats), "maxLat": max(lats),
+                    "minLon": min(lons), "maxLon": max(lons),
+                }
     return PartitionSummary(path=partition, photo_count=len(entries), _stats=stats)
 
 
