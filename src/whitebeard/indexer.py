@@ -13,6 +13,7 @@ from typing import Generator
 _log = logging.getLogger(__name__)
 
 from ouestcharlie_toolkit.backend import Backend
+from ouestcharlie_toolkit.fields import PHOTO_FIELDS, FieldDef, FieldType
 from ouestcharlie_toolkit.manifest import ManifestStore
 from ouestcharlie_toolkit.schema import (
     METADATA_DIR,
@@ -319,21 +320,30 @@ def _naive(dt: datetime) -> datetime:
     return dt.replace(tzinfo=None)
 
 
-def _aggregate_summary(path: str, children: list[PartitionSummary]) -> PartitionSummary:
+def _aggregate_summary(
+    path: str,
+    children: list[PartitionSummary],
+    field_config: list[FieldDef] | None = None,
+) -> PartitionSummary:
     """Aggregate child summaries into a single parent-level summary."""
-    total = sum(c.photo_count for c in children)
-    dates_min = [c.date_min for c in children if c.date_min is not None]
-    dates_max = [c.date_max for c in children if c.date_max is not None]
-    rating_mins = [c.rating_min for c in children if c.rating_min is not None]
-    rating_maxes = [c.rating_max for c in children if c.rating_max is not None]
-    return PartitionSummary(
-        path=path,
-        photo_count=total,
-        date_min=min(dates_min, key=_naive) if dates_min else None,
-        date_max=max(dates_max, key=_naive) if dates_max else None,
-        rating_min=min(rating_mins) if rating_mins else None,
-        rating_max=max(rating_maxes) if rating_maxes else None,
-    )
+    if field_config is None:
+        field_config = PHOTO_FIELDS
+    kwargs: dict = {
+        "path": path,
+        "photo_count": sum(c.photo_count for c in children),
+    }
+    for fdef in field_config:
+        if fdef.summary_min_attr is None or fdef.summary_max_attr is None:
+            continue
+        mins  = [v for c in children if (v := getattr(c, fdef.summary_min_attr, None)) is not None]
+        maxes = [v for c in children if (v := getattr(c, fdef.summary_max_attr, None)) is not None]
+        if fdef.type == FieldType.DATE_RANGE:
+            kwargs[fdef.summary_min_attr] = min(mins,  key=_naive) if mins  else None
+            kwargs[fdef.summary_max_attr] = max(maxes, key=_naive) if maxes else None
+        elif fdef.type == FieldType.INT_RANGE:
+            kwargs[fdef.summary_min_attr] = min(mins)  if mins  else None
+            kwargs[fdef.summary_max_attr] = max(maxes) if maxes else None
+    return PartitionSummary(**kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -382,37 +392,48 @@ def _sidecar_to_entry(
     sidecar: XmpSidecar,
     content_hash: str,
     xmp_version_token: str,
+    field_config: list[FieldDef] | None = None,
 ) -> PhotoEntry:
     """Convert an XmpSidecar to a PhotoEntry for the leaf manifest."""
-    return PhotoEntry(
-        filename=filename,
-        content_hash=content_hash,
-        date_taken=sidecar.date_taken,
-        make=sidecar.camera_make,
-        model=sidecar.camera_model,
-        gps=sidecar.gps,
-        orientation=sidecar.orientation,
-        tags=list(sidecar.tags),
-        rating=sidecar.rating,
-        width=sidecar.width,
-        height=sidecar.height,
-        metadata_version=sidecar.metadata_version,
-        xmp_version_token=xmp_version_token,
-    )
+    if field_config is None:
+        field_config = PHOTO_FIELDS
+    # Identity fields: no XmpSidecar equivalent, always supplied by caller
+    kwargs: dict = {
+        "filename": filename,
+        "content_hash": content_hash,
+        "metadata_version": sidecar.metadata_version,
+        "xmp_version_token": xmp_version_token,
+    }
+    # All other fields driven by field config via sidecar_attr
+    for fdef in field_config:
+        if fdef.sidecar_attr is not None:
+            val = getattr(sidecar, fdef.sidecar_attr, None)
+            if fdef.type == FieldType.STRING_COLLECTION and val is not None:
+                val = list(val)  # defensive copy (same as previous list(sidecar.tags))
+            kwargs[fdef.entry_attr] = val
+    return PhotoEntry(**kwargs)
 
 
-def _compute_summary(partition: str, entries: list[PhotoEntry]) -> PartitionSummary:
+def _compute_summary(
+    partition: str,
+    entries: list[PhotoEntry],
+    field_config: list[FieldDef] | None = None,
+) -> PartitionSummary:
     """Compute partition-level summary statistics from photo entries."""
-    dates = [e.date_taken for e in entries if e.date_taken is not None]
-    ratings = [e.rating for e in entries if e.rating is not None]
-    return PartitionSummary(
-        path=partition,
-        photo_count=len(entries),
-        date_min=min(dates, key=_naive) if dates else None,
-        date_max=max(dates, key=_naive) if dates else None,
-        rating_min=min(ratings) if ratings else None,
-        rating_max=max(ratings) if ratings else None,
-    )
+    if field_config is None:
+        field_config = PHOTO_FIELDS
+    kwargs: dict = {"path": partition, "photo_count": len(entries)}
+    for fdef in field_config:
+        if fdef.summary_min_attr is None or fdef.summary_max_attr is None:
+            continue
+        values = [v for e in entries if (v := getattr(e, fdef.entry_attr, None)) is not None]
+        if fdef.type == FieldType.DATE_RANGE:
+            kwargs[fdef.summary_min_attr] = min(values, key=_naive) if values else None
+            kwargs[fdef.summary_max_attr] = max(values, key=_naive) if values else None
+        elif fdef.type == FieldType.INT_RANGE:
+            kwargs[fdef.summary_min_attr] = min(values) if values else None
+            kwargs[fdef.summary_max_attr] = max(values) if values else None
+    return PartitionSummary(**kwargs)
 
 
 async def _upsert_leaf_manifest(
