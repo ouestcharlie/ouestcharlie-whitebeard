@@ -441,21 +441,20 @@ def _sidecar_to_entry(
     """Convert an XmpSidecar to a PhotoEntry for the leaf manifest."""
     if field_config is None:
         field_config = PHOTO_FIELDS
-    # Identity fields: no XmpSidecar equivalent, always supplied by caller
-    kwargs: dict = {
-        "filename": filename,
-        "content_hash": content_hash,
-        "metadata_version": sidecar.metadata_version,
-        "xmp_version_token": xmp_version_token,
-    }
-    # All other fields driven by field config via sidecar_attr
+    searchable: dict = {}
     for fdef in field_config:
         if fdef.sidecar_attr is not None:
             val = getattr(sidecar, fdef.sidecar_attr, None)
             if fdef.type == FieldType.STRING_COLLECTION and val is not None:
-                val = list(val)  # defensive copy (same as previous list(sidecar.tags))
-            kwargs[fdef.entry_attr] = val
-    return PhotoEntry(**kwargs)
+                val = list(val)  # defensive copy
+            searchable[fdef.entry_attr] = val
+    return PhotoEntry(
+        filename=filename,
+        content_hash=content_hash,
+        metadata_version=sidecar.metadata_version,
+        xmp_version_token=xmp_version_token,
+        searchable=searchable,
+    )
 
 
 def _compute_summary(
@@ -470,7 +469,7 @@ def _compute_summary(
     for fdef in field_config:
         if not fdef.summary_range:
             continue
-        values = [v for e in entries if (v := getattr(e, fdef.entry_attr, None)) is not None]
+        values = [v for e in entries if (v := e.searchable.get(fdef.entry_attr)) is not None]
         if not values:
             continue
         if fdef.type == FieldType.DATE_RANGE:
