@@ -190,7 +190,7 @@ async def index_library(
     force: bool = False,
     generate_thumbnails: bool = False,
     extract_exif: bool = True,
-    on_progress: Callable[[int, int, str], Awaitable[None]] | None = None,
+    on_progress: Callable[[int, int, str, int], Awaitable[None]] | None = None,
 ) -> LibraryIndexResult:
     """Recursively index all photos in a library and build hierarchical manifests.
 
@@ -223,8 +223,6 @@ async def index_library(
     sorted_partitions = sorted(leaf_partitions)
     total_partitions = len(sorted_partitions)
     for i, partition in enumerate(sorted_partitions):
-        if on_progress is not None:
-            await on_progress(i, total_partitions, partition)
         partition_result = await index_partition(
             backend, partition, force,
             generate_thumbnails=generate_thumbnails,
@@ -233,10 +231,12 @@ async def index_library(
         library_result.partitions.append(partition_result)
         if partition_result.summary is not None:
             leaf_summaries[partition] = partition_result.summary
+        if on_progress is not None:
+            await on_progress(i + 1, total_partitions, partition, partition_result.duration_ms)
 
     # Build parent manifests bottom-up.
     if on_progress is not None:
-        await on_progress(total_partitions, total_partitions, "building manifests")
+        await on_progress(total_partitions, total_partitions, "building manifests", 0)
     await _build_parent_manifests(manifest_store, leaf_summaries, root)
 
     return library_result
@@ -291,7 +291,7 @@ async def _build_parent_manifests(
 
     For each ancestor folder of any leaf partition (up to ``library_root``),
     creates or updates a parent manifest whose children are the immediate
-    sub-partitions at that level, with aggregated photo counts and date ranges.
+    sub-partitions at that level, with aggregated photo counts and statistics
     """
     if not leaf_summaries:
         return
@@ -452,6 +452,8 @@ def _sidecar_to_entry(
     """Convert an XmpSidecar to a PhotoEntry for the leaf manifest."""
     if field_config is None:
         field_config = PHOTO_FIELDS
+    
+    # Build searchable dict
     searchable: dict = {}
     for fdef in field_config:
         if fdef.sidecar_attr is not None:
@@ -459,6 +461,8 @@ def _sidecar_to_entry(
             if fdef.type == FieldType.STRING_COLLECTION and val is not None:
                 val = list(val)  # defensive copy
             searchable[fdef.entry_attr] = val
+
+    # Compose the PhotoEntry
     return PhotoEntry(
         filename=filename,
         content_hash=content_hash,

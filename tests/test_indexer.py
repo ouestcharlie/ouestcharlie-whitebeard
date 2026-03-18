@@ -134,9 +134,9 @@ async def test_index_manifest_has_date(backend_with_sample: LocalBackend, tmpdir
     await index_partition(backend_with_sample, "")
     data = json.loads((tmpdir / METADATA_DIR / "manifest.json").read_text())
     # 001.jpg has EXIF DateTimeOriginal
-    assert "date" in data["summary"]
-    assert "min" in data["summary"]["date"]
-    assert "max" in data["summary"]["date"]
+    assert "dateTaken" in data["summary"]
+    assert "min" in data["summary"]["dateTaken"]
+    assert "max" in data["summary"]["dateTaken"]
 
 
 @pytest.mark.asyncio
@@ -616,9 +616,9 @@ async def test_index_mixed_timezone_photos(tmpdir: Path) -> None:
 
     assert result.errors == 0
     assert result.summary is not None
-    assert result.summary.date is not None
-    assert result.summary.date["min"] is not None
-    assert result.summary.date["max"] is not None
+    assert result.summary.dateTaken is not None
+    assert result.summary.dateTaken["min"] is not None
+    assert result.summary.dateTaken["max"] is not None
 
 
 # ---------------------------------------------------------------------------

@@ -68,11 +68,15 @@ class WhitebeardAgent(AgentBase):
                 ``errorDetails`` — list of per-photo error messages.
                 ``durationMs`` — wall-clock time for this partition in milliseconds.
             """
-            result = await index_partition(
-                self.backend, partition, force=force,
-                generate_thumbnails=generate_thumbnails,
-                extract_exif=extract_exif,
-            )
+            try:
+                result = await index_partition(
+                    self.backend, partition, force=force,
+                    generate_thumbnails=generate_thumbnails,
+                    extract_exif=extract_exif,
+                )
+            except Exception as exc:
+                _log.error("index_partition_tool failed — partition=%r: %s", partition, exc, exc_info=True)
+                raise
             return {
                 "partition": result.partition,
                 "photosProcessed": result.photos_processed,
@@ -120,18 +124,23 @@ class WhitebeardAgent(AgentBase):
                 ``errorDetails`` — list of per-photo error messages across all partitions.
                 ``totalDurationMs`` — sum of per-partition wall-clock times in milliseconds.
             """
-            async def _library_progress(current: int, total: int, name: str) -> None:
+            async def _library_progress(current: int, total: int, name: str, duration_ms: int = 0) -> None:
+                message = f"{name} ({duration_ms}ms)" if duration_ms else name
                 try:
-                    await ctx.report_progress(progress=current, total=total, message=name)
+                    await ctx.report_progress(progress=current, total=total, message=message)
                 except Exception as exc:
                     _log.debug("Progress notification failed (client may have disconnected): %s", exc)
 
-            result = await index_library(
-                self.backend, root=root, force=force,
-                generate_thumbnails=generate_thumbnails,
-                extract_exif=extract_exif,
-                on_progress=_library_progress,
-            )
+            try:
+                result = await index_library(
+                    self.backend, root=root, force=force,
+                    generate_thumbnails=generate_thumbnails,
+                    extract_exif=extract_exif,
+                    on_progress=_library_progress,
+                )
+            except Exception as exc:
+                _log.error("index_library_tool failed — root=%r: %s", root, exc, exc_info=True)
+                raise
             return {
                 "partitionsIndexed": len(result.partitions),
                 "totalPhotos": result.total_photos,

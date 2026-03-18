@@ -18,7 +18,7 @@ import logging
 from ouestcharlie_toolkit import setup_logging
 
 # Set up logging before importing agent code (which may trigger library imports).
-_log_file = setup_logging("whitebeard", log_file_env_var="WHITEBEARD_LOG_FILE")
+_log_file = setup_logging("whitebeard", log_file_env_var="WHITEBEARD_LOG_FILE", level=logging.DEBUG)
 logging.getLogger(__name__).info("Whitebeard starting — log: %s", _log_file)
 
 from whitebeard.agent import WhitebeardAgent  # noqa: E402
