@@ -153,7 +153,7 @@ async def test_index_manifest_summary_rating_range(tmpdir: Path) -> None:
     ratings = [2, 5, 4]
     call_count = 0
 
-    async def fake_process(xmp_store, photo_path, force):
+    async def fake_process(xmp_store, photo_path, force_extract_exif):
         nonlocal call_count
         r = ratings[call_count]
         call_count += 1
@@ -216,7 +216,7 @@ async def test_index_force_overwrites_sidecar(backend_with_sample: LocalBackend,
     original_content = xmp_path.read_text(encoding="utf-8")
     xmp_path.write_text("<!-- overwritten -->", encoding="utf-8")
 
-    result = await index_partition(backend_with_sample, "", force=True)
+    result = await index_partition(backend_with_sample, "", force_extract_exif=True)
 
     assert result.sidecars_created == 1
     assert result.sidecars_skipped == 0
@@ -462,98 +462,6 @@ async def test_index_library_idempotent(tmpdir: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# extract_exif=False — manifest-only rebuild
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_extract_exif_false_uses_existing_sidecars(tmpdir: Path) -> None:
-    """extract_exif=False reads existing sidecars without creating new ones."""
-    from ouestcharlie_toolkit.schema import XmpSidecar
-    from ouestcharlie_toolkit.xmp import serialize_xmp
-
-    (tmpdir / "photo.jpg").write_bytes(_MINIMAL_JPEG)
-    sidecar = XmpSidecar(content_hash="sha256:" + "a" * 64)
-    (tmpdir / "photo.xmp").write_text(serialize_xmp(sidecar), encoding="utf-8")
-    backend = LocalBackend(root=str(tmpdir))
-
-    result = await index_partition(backend, "", extract_exif=False)
-
-    assert result.photos_processed == 1
-    assert result.sidecars_created == 0
-    assert result.sidecars_skipped == 1
-    assert result.errors == 0
-
-    # Manifest must contain the photo.
-    data = json.loads((tmpdir / METADATA_DIR / "manifest.json").read_text())
-    assert len(data["photos"]) == 1
-    assert data["photos"][0]["filename"] == "photo.jpg"
-
-
-@pytest.mark.asyncio
-async def test_extract_exif_false_skips_photos_without_sidecar(tmpdir: Path) -> None:
-    """extract_exif=False silently skips photos that have no XMP sidecar."""
-    (tmpdir / "photo.jpg").write_bytes(_MINIMAL_JPEG)
-    backend = LocalBackend(root=str(tmpdir))
-
-    result = await index_partition(backend, "", extract_exif=False)
-
-    assert result.photos_processed == 1
-    assert result.sidecars_created == 0
-    assert result.sidecars_skipped == 1
-    assert result.errors == 0
-
-    # Manifest exists but has no photos (all were skipped).
-    data = json.loads((tmpdir / METADATA_DIR / "manifest.json").read_text())
-    assert data["photos"] == []
-
-
-@pytest.mark.asyncio
-async def test_extract_exif_false_does_not_modify_sidecar(tmpdir: Path) -> None:
-    """extract_exif=False never writes to XMP sidecars."""
-    from ouestcharlie_toolkit.schema import XmpSidecar
-    from ouestcharlie_toolkit.xmp import serialize_xmp
-
-    (tmpdir / "photo.jpg").write_bytes(_MINIMAL_JPEG)
-    sidecar = XmpSidecar(content_hash="sha256:" + "b" * 64)
-    original_xmp = serialize_xmp(sidecar)
-    (tmpdir / "photo.xmp").write_text(original_xmp, encoding="utf-8")
-    backend = LocalBackend(root=str(tmpdir))
-
-    await index_partition(backend, "", extract_exif=False)
-
-    assert (tmpdir / "photo.xmp").read_text(encoding="utf-8") == original_xmp
-
-
-@pytest.mark.asyncio
-async def test_index_library_extract_exif_false(tmpdir: Path) -> None:
-    """index_library with extract_exif=False rebuilds all manifests from existing sidecars."""
-    from ouestcharlie_toolkit.schema import XmpSidecar
-    from ouestcharlie_toolkit.xmp import serialize_xmp
-
-    (tmpdir / "A").mkdir()
-    (tmpdir / "B").mkdir()
-    for photo, letter in [("A/p1.jpg", "c"), ("B/p2.jpg", "d")]:
-        (tmpdir / photo).write_bytes(_MINIMAL_JPEG)
-        sidecar = XmpSidecar(content_hash=f"sha256:{letter * 64}")
-        xmp = tmpdir / photo.replace(".jpg", ".xmp")
-        xmp.write_text(serialize_xmp(sidecar), encoding="utf-8")
-    backend = LocalBackend(root=str(tmpdir))
-
-    result = await index_library(backend, extract_exif=False)
-
-    assert result.total_photos == 2
-    assert result.total_sidecars_created == 0
-    assert result.total_errors == 0
-
-    # Parent manifest exists and covers both children.
-    root_data = json.loads((tmpdir / METADATA_DIR / "manifest.json").read_text())
-    child_paths = {c["path"] for c in root_data["children"]}
-    assert "A" in child_paths
-    assert "B" in child_paths
-
-
-# ---------------------------------------------------------------------------
 # Logging behaviour
 # ---------------------------------------------------------------------------
 
@@ -601,7 +509,7 @@ async def test_index_mixed_timezone_photos(tmpdir: Path) -> None:
 
     call_count = 0
 
-    async def fake_process(xmp_store, photo_path, force):
+    async def fake_process(xmp_store, photo_path, force_extract_exif):
         nonlocal call_count
         call_count += 1
         dt = naive_dt if call_count == 1 else aware_dt

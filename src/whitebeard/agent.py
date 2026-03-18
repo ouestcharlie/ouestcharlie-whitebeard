@@ -31,17 +31,16 @@ class WhitebeardAgent(AgentBase):
         async def index_partition_tool(
             ctx: Context,
             partition: str,
-            force: bool = False,
+            force_extract_exif: bool = False,
             generate_thumbnails: bool = True,
-            extract_exif: bool = True,
         ) -> dict:
             """Index all photos directly in a partition folder.
 
             Scans ``partition`` for photo files (JPEG, HEIC, PNG, RAW).  For
             each photo without an existing XMP sidecar (or all photos when
-            ``force=True``), extracts EXIF metadata and writes an XMP sidecar
-            containing ``ouestcharlie:contentHash`` and all standard EXIF
-            fields.  Creates or updates the leaf manifest at
+            ``force_extract_exif=True``), extracts EXIF metadata and writes an
+            XMP sidecar containing ``ouestcharlie:contentHash`` and all
+            standard EXIF fields.  Creates or updates the leaf manifest at
             ``<partition>/.ouestcharlie/manifest.json``, and generates
             ``thumbnails.avif`` (256 px tiles) and ``previews.avif`` (1440 px
             tiles) in the same metadata directory.
@@ -50,13 +49,10 @@ class WhitebeardAgent(AgentBase):
                 partition: Folder path relative to the backend root, e.g.
                     ``""`` for the root, ``"Vacations/Italy 2023/"`` for a
                     sub-folder.  Trailing slash is optional.
-                force: Re-extract EXIF and overwrite existing XMP sidecars.
+                force_extract_exif: Re-extract EXIF and overwrite existing
+                    XMP sidecars.  Defaults to False.
                 generate_thumbnails: Generate ``thumbnails.avif`` and
                     ``previews.avif`` AVIF grids.  Defaults to True.
-                extract_exif: Extract EXIF and create/update XMP sidecars.
-                    Set to False to skip EXIF extraction and only rebuild the
-                    manifest from existing sidecars.  Cannot be combined with
-                    ``force``.  Defaults to True.
 
             Returns:
                 ``partition`` — echoed partition path.
@@ -70,9 +66,8 @@ class WhitebeardAgent(AgentBase):
             """
             try:
                 result = await index_partition(
-                    self.backend, partition, force=force,
+                    self.backend, partition, force_extract_exif,
                     generate_thumbnails=generate_thumbnails,
-                    extract_exif=extract_exif,
                 )
             except Exception as exc:
                 _log.error("index_partition_tool failed — partition=%r: %s", partition, exc, exc_info=True)
@@ -92,9 +87,8 @@ class WhitebeardAgent(AgentBase):
         async def index_library_tool(
             ctx: Context,
             root: str = "",
-            force: bool = False,
+            force_extract_exif: bool = False,
             generate_thumbnails: bool = True,
-            extract_exif: bool = True,
         ) -> dict:
             """Recursively index all photos in the library and build manifests.
 
@@ -106,14 +100,11 @@ class WhitebeardAgent(AgentBase):
             Args:
                 root: Library root relative to the backend root.  Defaults to
                     ``""`` (the entire backend).
-                force: Re-extract EXIF and overwrite existing XMP sidecars.
+                force_extract_exif: Re-extract EXIF and overwrite existing
+                    XMP sidecars.  Defaults to False.
                 generate_thumbnails: Generate ``thumbnails.avif`` and
                     ``previews.avif`` AVIF grids for each partition.  Defaults
                     to True.
-                extract_exif: Extract EXIF and create/update XMP sidecars.
-                    Set to False to skip EXIF extraction and only rebuild
-                    manifests from existing sidecars.  Cannot be combined with
-                    ``force``.  Defaults to True.
 
             Returns:
                 ``partitionsIndexed`` — number of leaf partitions processed.
@@ -124,8 +115,8 @@ class WhitebeardAgent(AgentBase):
                 ``errorDetails`` — list of per-photo error messages across all partitions.
                 ``totalDurationMs`` — sum of per-partition wall-clock times in milliseconds.
             """
-            async def _library_progress(current: int, total: int, name: str, duration_ms: int = 0) -> None:
-                message = f"{name} ({duration_ms}ms)" if duration_ms else name
+            async def _library_progress(current: int, total: int, name: str, duration_ms: int = 0, photos: int = 0) -> None:
+                message = f"{name} — {photos} photos ({duration_ms}ms)" if duration_ms else name
                 try:
                     await ctx.report_progress(progress=current, total=total, message=message)
                 except Exception as exc:
@@ -133,9 +124,8 @@ class WhitebeardAgent(AgentBase):
 
             try:
                 result = await index_library(
-                    self.backend, root=root, force=force,
+                    self.backend, root=root, force_extract_exif=force_extract_exif,
                     generate_thumbnails=generate_thumbnails,
-                    extract_exif=extract_exif,
                     on_progress=_library_progress,
                 )
             except Exception as exc:

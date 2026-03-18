@@ -90,15 +90,14 @@ class LibraryIndexResult:
 async def index_partition(
     backend: Backend,
     partition: str,
-    force: bool = False,
+    force_extract_exif: bool = False,
     generate_thumbnails: bool = False,
-    extract_exif: bool = True,
 ) -> IndexResult:
     """Index all photos in a partition (index mode — files stay in place).
 
     For each photo directly in the partition:
-    - If an XMP sidecar already exists and force=False, preserve it and include
-      the photo in the manifest from the existing sidecar data.
+    - If an XMP sidecar already exists and force_extract_exif=False, preserve
+      it and include the photo in the manifest from the existing sidecar data.
     - Otherwise extract EXIF, write a new XMP sidecar, and add to the manifest.
 
     After processing all photos, creates or updates the leaf manifest for the
@@ -108,13 +107,11 @@ async def index_partition(
         backend: Backend to read/write.
         partition: Folder path relative to backend root (e.g. "" for root,
             "Vacations/Italy 2023/" for a subfolder). Trailing slash optional.
-        force: If True, re-extract EXIF and overwrite existing XMP sidecars.
+        force_extract_exif: If True, re-extract EXIF and overwrite existing
+            XMP sidecars.  If False (default), existing sidecars are reused.
         generate_thumbnails: If True, generate thumbnail and preview AVIF
             containers after indexing.  Requires the avif-grid binary.
             Defaults to False; the MCP agent sets this to True.
-        extract_exif: If False, skip EXIF extraction and rebuild the manifest
-            from existing XMP sidecars only.  Photos without a sidecar are
-            skipped.  Defaults to True.
 
     Returns:
         IndexResult with counts of processed, created, skipped, and failed photos.
@@ -134,24 +131,12 @@ async def index_partition(
         result.photos_processed += 1
         filename = PurePath(file_info.path).name
         try:
-            if extract_exif:
-                entry, created = await _extract_one(xmp_store, file_info.path, force)
-                photo_entries.append(entry)
-                if created:
-                    result.sidecars_created += 1
-                else:
-                    result.sidecars_skipped += 1
+            entry, created = await _extract_one(xmp_store, file_info.path, force_extract_exif)
+            photo_entries.append(entry)
+            if created:
+                result.sidecars_created += 1
             else:
-                entry = await _read_existing_sidecar(xmp_store, file_info.path)
-                if entry is None:
-                    _log.debug(
-                        "No sidecar found — partition=%r file=%r, skipping",
-                        partition, filename,
-                    )
-                    result.sidecars_skipped += 1
-                    continue
-                photo_entries.append(entry)
-                result.sidecars_skipped += 1                
+                result.sidecars_skipped += 1
         except Exception as exc:
             _log.error(
                 "Failed to process photo — partition=%r file=%r: %s",
@@ -187,10 +172,9 @@ async def index_partition(
 async def index_library(
     backend: Backend,
     root: str = "",
-    force: bool = False,
+    force_extract_exif: bool = False,
     generate_thumbnails: bool = False,
-    extract_exif: bool = True,
-    on_progress: Callable[[int, int, str, int], Awaitable[None]] | None = None,
+    on_progress: Callable[[int, int, str, int, int], Awaitable[None]] | None = None,
 ) -> LibraryIndexResult:
     """Recursively index all photos in a library and build hierarchical manifests.
 
@@ -202,11 +186,10 @@ async def index_library(
         backend: Backend to read/write.
         root: Library root relative to the backend root (e.g. "" for the full
             backend, "Vacations/" to scope to a subfolder).
-        force: If True, re-extract EXIF and overwrite existing XMP sidecars.
+        force_extract_exif: If True, re-extract EXIF and overwrite existing
+            XMP sidecars.  Passed through to ``index_partition``.
         generate_thumbnails: If True, generate thumbnail AVIF containers for
             each partition.  Passed through to ``index_partition``.
-        extract_exif: If False, skip EXIF extraction and only rebuild manifests
-            from existing XMP sidecars.  Passed through to ``index_partition``.
 
     Returns:
         LibraryIndexResult aggregating every per-partition IndexResult.
@@ -224,19 +207,18 @@ async def index_library(
     total_partitions = len(sorted_partitions)
     for i, partition in enumerate(sorted_partitions):
         partition_result = await index_partition(
-            backend, partition, force,
+            backend, partition, force_extract_exif,
             generate_thumbnails=generate_thumbnails,
-            extract_exif=extract_exif,
         )
         library_result.partitions.append(partition_result)
         if partition_result.summary is not None:
             leaf_summaries[partition] = partition_result.summary
         if on_progress is not None:
-            await on_progress(i + 1, total_partitions, partition, partition_result.duration_ms)
+            await on_progress(i + 1, total_partitions, partition, partition_result.duration_ms, partition_result.photos_processed)
 
     # Build parent manifests bottom-up.
     if on_progress is not None:
-        await on_progress(total_partitions, total_partitions, "building manifests", 0)
+        await on_progress(total_partitions, total_partitions, "building manifests", 0, 0)
     await _build_parent_manifests(manifest_store, leaf_summaries, root)
 
     return library_result
@@ -410,7 +392,7 @@ def _filter_photo_files(
 async def _extract_one(
     xmp_store: XmpStore,
     photo_path: str,
-    force: bool,
+    force_extract_exif: bool,
 ) -> tuple[PhotoEntry, bool]:
     """Process a single photo.
 
@@ -418,28 +400,12 @@ async def _extract_one(
         (PhotoEntry, created) where created=True if a new sidecar was written.
     """
     sidecar, version, created = await xmp_store.read_or_create_from_picture(
-        photo_path, force=force
+        photo_path, force=force_extract_exif
     )
     filename = PurePath(photo_path).name
     entry = _sidecar_to_entry(filename, sidecar, sidecar.content_hash or "", str(version.value))
     return entry, created
 
-
-async def _read_existing_sidecar(
-    xmp_store: XmpStore,
-    photo_path: str,
-) -> PhotoEntry | None:
-    """Read an existing XMP sidecar without creating one.
-
-    Returns:
-        PhotoEntry if a sidecar exists, None otherwise.
-    """
-    try:
-        sidecar, version = await xmp_store.read(photo_path)
-    except FileNotFoundError:
-        return None
-    filename = PurePath(photo_path).name
-    return _sidecar_to_entry(filename, sidecar, sidecar.content_hash or "", str(version.value))
 
 
 def _sidecar_to_entry(
