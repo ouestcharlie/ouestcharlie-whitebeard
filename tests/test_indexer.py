@@ -13,7 +13,7 @@ from unittest.mock import patch
 import pytest
 
 from ouestcharlie_toolkit.backends.local import LocalBackend
-from ouestcharlie_toolkit.schema import METADATA_DIR, manifest_path
+from ouestcharlie_toolkit.schema import METADATA_DIR, manifest_path, summary_path
 from ouestcharlie_toolkit.xmp import parse_xmp, xmp_path_for
 
 from whitebeard.indexer import (
@@ -142,8 +142,7 @@ async def test_index_manifest_has_date(backend_with_sample: LocalBackend, tmpdir
 @pytest.mark.asyncio
 async def test_index_manifest_summary_rating_range(tmpdir: Path) -> None:
     """Leaf manifest summary has ratingMin/ratingMax when photos have ratings."""
-    from ouestcharlie_toolkit.schema import XmpSidecar, VersionToken
-    from whitebeard.indexer import _sidecar_to_entry
+    from ouestcharlie_toolkit.schema import PhotoEntry, XmpSidecar, VersionToken
 
     (tmpdir / "a.jpg").write_bytes(_MINIMAL_JPEG)
     (tmpdir / "b.jpg").write_bytes(_MINIMAL_JPEG)
@@ -158,7 +157,7 @@ async def test_index_manifest_summary_rating_range(tmpdir: Path) -> None:
         r = ratings[call_count]
         call_count += 1
         sidecar = XmpSidecar(content_hash=f"sha256:{'0' * 63}{call_count}", rating=r)
-        entry = _sidecar_to_entry(photo_path.split("/")[-1], sidecar, sidecar.content_hash, "1")
+        entry = PhotoEntry.from_sidecar(photo_path.split("/")[-1], sidecar, sidecar.content_hash, "1")
         return entry, True
 
     with patch("whitebeard.indexer._extract_one", side_effect=fake_process):
@@ -318,8 +317,41 @@ async def test_index_library_single_partition(tmpdir: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_index_library_builds_parent_manifest(tmpdir: Path) -> None:
-    """Two leaf partitions under a common parent produce a parent manifest."""
+async def test_index_partition_writes_summary_json(tmpdir: Path) -> None:
+    """index_partition creates summary.json at the backend root."""
+    (tmpdir / "2024" / "2024-07").mkdir(parents=True)
+    (tmpdir / "2024" / "2024-07" / "a.jpg").write_bytes(_MINIMAL_JPEG)
+    backend = LocalBackend(root=str(tmpdir))
+
+    await index_partition(backend, "2024/2024-07")
+
+    summary_file = tmpdir / ".ouestcharlie" / "summary.json"
+    assert summary_file.exists()
+    data = json.loads(summary_file.read_text())
+    assert len(data["partitions"]) == 1
+    assert data["partitions"][0]["path"] == "2024/2024-07"
+    assert data["partitions"][0]["photoCount"] == 1
+
+
+@pytest.mark.asyncio
+async def test_index_partition_updates_existing_summary(tmpdir: Path) -> None:
+    """Re-indexing a partition replaces its entry in summary.json."""
+    (tmpdir / "A").mkdir()
+    (tmpdir / "A" / "p1.jpg").write_bytes(_MINIMAL_JPEG)
+    (tmpdir / "A" / "p2.jpg").write_bytes(_MINIMAL_JPEG)
+    backend = LocalBackend(root=str(tmpdir))
+
+    await index_partition(backend, "A")
+    await index_partition(backend, "A")  # second run — should not duplicate
+
+    data = json.loads((tmpdir / ".ouestcharlie" / "summary.json").read_text())
+    assert len(data["partitions"]) == 1
+    assert data["partitions"][0]["photoCount"] == 2
+
+
+@pytest.mark.asyncio
+async def test_index_library_writes_summary_json(tmpdir: Path) -> None:
+    """index_library produces summary.json listing all indexed partitions."""
     (tmpdir / "2024" / "2024-07").mkdir(parents=True)
     (tmpdir / "2024" / "2024-08").mkdir(parents=True)
     (tmpdir / "2024" / "2024-07" / "a.jpg").write_bytes(_MINIMAL_JPEG)
@@ -329,93 +361,67 @@ async def test_index_library_builds_parent_manifest(tmpdir: Path) -> None:
     result = await index_library(backend)
 
     assert result.total_photos == 2
-    assert len(result.partitions) == 2
-
-    # Leaf manifests.
+    # Leaf manifests exist.
     assert (tmpdir / "2024" / "2024-07" / METADATA_DIR / "manifest.json").exists()
     assert (tmpdir / "2024" / "2024-08" / METADATA_DIR / "manifest.json").exists()
-
-    # Parent manifest for 2024/.
-    parent_file = tmpdir / "2024" / METADATA_DIR / "manifest.json"
-    assert parent_file.exists()
-    parent_data = json.loads(parent_file.read_text())
-    assert len(parent_data["children"]) == 2
-    child_paths = {c["path"] for c in parent_data["children"]}
-    assert "2024/2024-07" in child_paths
-    assert "2024/2024-08" in child_paths
-
-    # Root parent manifest.
-    root_file = tmpdir / METADATA_DIR / "manifest.json"
-    assert root_file.exists()
-    root_data = json.loads(root_file.read_text())
-    assert any(c["path"] == "2024" for c in root_data["children"])
+    # No intermediate parent manifest at 2024/.
+    assert not (tmpdir / "2024" / METADATA_DIR / "manifest.json").exists()
+    # summary.json lists both leaf partitions.
+    data = json.loads((tmpdir / ".ouestcharlie" / "summary.json").read_text())
+    paths = {p["path"] for p in data["partitions"]}
+    assert "2024/2024-07" in paths
+    assert "2024/2024-08" in paths
 
 
 @pytest.mark.asyncio
-async def test_index_library_three_levels(tmpdir: Path) -> None:
-    """Three-level hierarchy: root → year → month → photos."""
+async def test_index_library_no_parent_manifests(tmpdir: Path) -> None:
+    """Intermediate folders (e.g. year level) must NOT get a manifest.json."""
     (tmpdir / "2024" / "July" / "Vacation").mkdir(parents=True)
     shutil.copy(_SAMPLE_JPG, tmpdir / "2024" / "July" / "Vacation" / "001.jpg")
     backend = LocalBackend(root=str(tmpdir))
 
     await index_library(backend)
 
-    # Leaf at 2024/July/Vacation.
+    # Only the folder directly containing photos gets a manifest.json.
     assert (tmpdir / "2024" / "July" / "Vacation" / METADATA_DIR / "manifest.json").exists()
-    # Parent at 2024/July.
-    assert (tmpdir / "2024" / "July" / METADATA_DIR / "manifest.json").exists()
-    # Parent at 2024.
-    assert (tmpdir / "2024" / METADATA_DIR / "manifest.json").exists()
-    # Root parent.
-    assert (tmpdir / METADATA_DIR / "manifest.json").exists()
+    assert not (tmpdir / "2024" / "July" / METADATA_DIR / "manifest.json").exists()
+    assert not (tmpdir / "2024" / METADATA_DIR / "manifest.json").exists()
+    # summary.json exists at root.
+    assert (tmpdir / METADATA_DIR / "summary.json").exists()
 
 
 @pytest.mark.asyncio
-async def test_index_library_parent_rating_range(tmpdir: Path) -> None:
-    """Parent manifest ratingMin/ratingMax aggregate across child partitions."""
-    from ouestcharlie_toolkit.schema import XmpSidecar, VersionToken
-    from whitebeard.indexer import _sidecar_to_entry
+async def test_index_library_summary_rating_range(tmpdir: Path) -> None:
+    """summary.json contains per-partition rating ranges."""
+    from ouestcharlie_toolkit.schema import XmpSidecar
     from ouestcharlie_toolkit.xmp import serialize_xmp
 
-    # Partition A: photos rated 2 and 4 → ratingMin=2, ratingMax=4
     (tmpdir / "A").mkdir()
     (tmpdir / "A" / "p1.jpg").write_bytes(_MINIMAL_JPEG)
     (tmpdir / "A" / "p2.jpg").write_bytes(_MINIMAL_JPEG)
-    # Partition B: photo rated 5 → ratingMin=5, ratingMax=5
     (tmpdir / "B").mkdir()
     (tmpdir / "B" / "p3.jpg").write_bytes(_MINIMAL_JPEG)
     backend = LocalBackend(root=str(tmpdir))
 
-    # Write XMP sidecars with known ratings before indexing.
     for photo, rating in [("A/p1.jpg", 2), ("A/p2.jpg", 4), ("B/p3.jpg", 5)]:
-        sidecar = XmpSidecar(
-            content_hash=f"sha256:{'0' * 63}{rating}",
-            rating=rating,
-        )
-        xmp_path = tmpdir / photo.replace(".jpg", ".xmp")
-        xmp_path.write_text(serialize_xmp(sidecar), encoding="utf-8")
+        sidecar = XmpSidecar(content_hash=f"sha256:{'0' * 63}{rating}", rating=rating)
+        xmp_file = tmpdir / photo.replace(".jpg", ".xmp")
+        xmp_file.write_text(serialize_xmp(sidecar), encoding="utf-8")
 
     await index_library(backend)
 
-    root_data = json.loads((tmpdir / METADATA_DIR / "manifest.json").read_text())
-    child_a = next(c for c in root_data["children"] if c["path"] == "A")
-    child_b = next(c for c in root_data["children"] if c["path"] == "B")
-
-    assert child_a["rating"]["min"] == 2
-    assert child_a["rating"]["max"] == 4
-    assert child_b["rating"]["min"] == 5
-    assert child_b["rating"]["max"] == 5
-
-    # Root-level aggregation: min/max across all children entries.
-    all_mins = [c["rating"]["min"] for c in root_data["children"] if "rating" in c]
-    all_maxes = [c["rating"]["max"] for c in root_data["children"] if "rating" in c]
-    assert min(all_mins) == 2
-    assert max(all_maxes) == 5
+    data = json.loads((tmpdir / ".ouestcharlie" / "summary.json").read_text())
+    part_a = next(p for p in data["partitions"] if p["path"] == "A")
+    part_b = next(p for p in data["partitions"] if p["path"] == "B")
+    assert part_a["rating"]["min"] == 2
+    assert part_a["rating"]["max"] == 4
+    assert part_b["rating"]["min"] == 5
+    assert part_b["rating"]["max"] == 5
 
 
 @pytest.mark.asyncio
-async def test_index_library_parent_photo_count(tmpdir: Path) -> None:
-    """Parent manifest photoCount aggregates all children."""
+async def test_index_library_summary_photo_count(tmpdir: Path) -> None:
+    """summary.json photoCount per partition matches actual photo count."""
     (tmpdir / "A").mkdir()
     (tmpdir / "B").mkdir()
     (tmpdir / "A" / "p1.jpg").write_bytes(_MINIMAL_JPEG)
@@ -425,9 +431,10 @@ async def test_index_library_parent_photo_count(tmpdir: Path) -> None:
 
     await index_library(backend)
 
-    root_data = json.loads((tmpdir / METADATA_DIR / "manifest.json").read_text())
-    total = sum(c["photoCount"] for c in root_data["children"])
-    assert total == 3
+    data = json.loads((tmpdir / ".ouestcharlie" / "summary.json").read_text())
+    counts = {p["path"]: p["photoCount"] for p in data["partitions"]}
+    assert counts["A"] == 2
+    assert counts["B"] == 1
 
 
 @pytest.mark.asyncio
@@ -498,7 +505,7 @@ async def test_index_mixed_timezone_photos(tmpdir: Path) -> None:
     _naive() key function.
     """
     from datetime import timezone, timedelta
-    from ouestcharlie_toolkit.schema import XmpSidecar, VersionToken
+    from ouestcharlie_toolkit.schema import PhotoEntry, XmpSidecar, VersionToken
 
     naive_dt = datetime(2024, 7, 1, 12, 0, 0)
     aware_dt = datetime(2024, 7, 2, 12, 0, 0, tzinfo=timezone(timedelta(hours=2)))
@@ -515,8 +522,7 @@ async def test_index_mixed_timezone_photos(tmpdir: Path) -> None:
         dt = naive_dt if call_count == 1 else aware_dt
         sidecar = XmpSidecar(content_hash=f"sha256:{'0' * 64}", date_taken=dt)
         token = VersionToken(value=1)
-        from whitebeard.indexer import _sidecar_to_entry
-        entry = _sidecar_to_entry(photo_path.split("/")[-1], sidecar, sidecar.content_hash, str(token.value))
+        entry = PhotoEntry.from_sidecar(photo_path.split("/")[-1], sidecar, sidecar.content_hash, str(token.value))
         return entry, True
 
     with patch("whitebeard.indexer._extract_one", side_effect=fake_process):

@@ -6,7 +6,6 @@ import logging
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from datetime import datetime
 from pathlib import PurePath
 from itertools import chain
 from typing import Generator
@@ -14,15 +13,13 @@ from typing import Generator
 _log = logging.getLogger(__name__)
 
 from ouestcharlie_toolkit.backend import Backend
-from ouestcharlie_toolkit.fields import PHOTO_FIELDS, FieldDef, FieldType
 from ouestcharlie_toolkit.manifest import ManifestStore
 from ouestcharlie_toolkit.schema import (
     METADATA_DIR,
     SCHEMA_VERSION,
     LeafManifest,
-    PartitionSummary,
+    ManifestSummary,
     PhotoEntry,
-    XmpSidecar,
 )
 
 # TYPE_CHECKING import for ThumbnailResult avoids circular imports at runtime.
@@ -51,7 +48,7 @@ class IndexResult:
     sidecars_skipped: int = 0
     errors: int = 0
     error_details: list[str] = field(default_factory=list)
-    summary: PartitionSummary | None = None
+    summary: ManifestSummary | None = None
     thumbnails_rebuilt: bool = False
     duration_ms: int = 0
 
@@ -102,6 +99,8 @@ async def index_partition(
 
     After processing all photos, creates or updates the leaf manifest for the
     partition (at ``<partition>/.ouestcharlie/manifest.json``).
+
+    Eventually update the root summary
 
     Args:
         backend: Backend to read/write.
@@ -165,6 +164,18 @@ async def index_partition(
         manifest_store, partition, photo_entries, thumbnail_result
     )
 
+    # Update the backend-wide summary.json with this partition's new summary.
+    if result.summary is not None:
+        try:
+            await manifest_store.upsert_partition_in_summary(result.summary)
+        except Exception as exc:
+            _log.error(
+                "Failed to update summary.json — partition=%r: %s",
+                partition, exc, exc_info=True,
+            )
+            result.errors += 1
+            result.error_details.append(f"summary.json update: {exc}")
+
     result.duration_ms = round((time.monotonic() - _t0) * 1000)
     return result
 
@@ -176,11 +187,11 @@ async def index_library(
     generate_thumbnails: bool = False,
     on_progress: Callable[[int, int, str, int, int], Awaitable[None]] | None = None,
 ) -> LibraryIndexResult:
-    """Recursively index all photos in a library and build hierarchical manifests.
+    """Index all photos in a library.
 
-    Walks all subdirectories under ``root``, indexes each folder that contains
-    photos as a leaf partition, then builds parent manifests bottom-up so every
-    ancestor folder has an aggregate manifest summarising its children.
+    Walks all subdirectories under ``root`` and indexes each folder that
+    directly contains photos. Each ``index_partition`` call writes both the
+    folder's ``manifest.json`` and updates the backend-wide ``summary.json``.
 
     Args:
         backend: Backend to read/write.
@@ -195,14 +206,12 @@ async def index_library(
         LibraryIndexResult aggregating every per-partition IndexResult.
     """
     library_result = LibraryIndexResult()
-    manifest_store = ManifestStore(backend)
 
-    # Discover all leaf partitions (directories directly containing photos).
+    # Discover all partitions (directories directly containing photos).
     all_files = await backend.list_files(root)
     leaf_partitions = _discover_leaf_partitions(all_files, root)
 
-    # Index each leaf partition, collecting summaries.
-    leaf_summaries: dict[str, PartitionSummary] = {}
+    # Index each partition; each call also updates summary.json.
     sorted_partitions = sorted(leaf_partitions)
     total_partitions = len(sorted_partitions)
     for i, partition in enumerate(sorted_partitions):
@@ -211,15 +220,8 @@ async def index_library(
             generate_thumbnails=generate_thumbnails,
         )
         library_result.partitions.append(partition_result)
-        if partition_result.summary is not None:
-            leaf_summaries[partition] = partition_result.summary
         if on_progress is not None:
             await on_progress(i + 1, total_partitions, partition, partition_result.duration_ms, partition_result.photos_processed)
-
-    # Build parent manifests bottom-up.
-    if on_progress is not None:
-        await on_progress(total_partitions, total_partitions, "building manifests", 0, 0)
-    await _build_parent_manifests(manifest_store, leaf_summaries, root)
 
     return library_result
 
@@ -250,120 +252,6 @@ def _discover_leaf_partitions(files: list, root: str) -> set[str]:
             parent = f.path[:slash_pos]
         leaf_partitions.add(parent)
     return leaf_partitions
-
-
-def _direct_parent(partition: str) -> str:
-    """Return the immediate parent of a partition path (empty string = root)."""
-    if "/" not in partition:
-        return ""
-    return partition.rsplit("/", 1)[0]
-
-
-# ---------------------------------------------------------------------------
-# Internal helpers — parent manifest construction
-# ---------------------------------------------------------------------------
-
-
-async def _build_parent_manifests(
-    manifest_store: ManifestStore,
-    leaf_summaries: dict[str, PartitionSummary],
-    library_root: str = "",
-) -> None:
-    """Build parent manifests from leaf summaries, bottom-up.
-
-    For each ancestor folder of any leaf partition (up to ``library_root``),
-    creates or updates a parent manifest whose children are the immediate
-    sub-partitions at that level, with aggregated photo counts and statistics
-    """
-    if not leaf_summaries:
-        return
-
-    # all_summaries starts with leaves; parent summaries are added as computed.
-    all_summaries: dict[str, PartitionSummary] = dict(leaf_summaries)
-
-    # Collect all ancestor paths that need parent manifests.
-    parent_paths: set[str] = set()
-    for partition in leaf_summaries:
-        current = partition
-        while current != library_root:
-            parent = _direct_parent(current)
-            parent_paths.add(parent)
-            if parent == library_root:
-                break
-            current = parent
-
-    if not parent_paths:
-        return
-
-    # Process deepest paths first (most path components), root last.
-    def _depth(p: str) -> int:
-        return len(p.split("/")) if p else 0
-
-    sorted_parents = sorted(parent_paths, key=_depth, reverse=True)
-    # Ensure library_root is always last (may already be in the list).
-    if library_root in sorted_parents:
-        sorted_parents.remove(library_root)
-    sorted_parents.append(library_root)
-
-    for parent_path in sorted_parents:
-        # Collect direct children of this parent from all known summaries.
-        direct_children = [
-            summary
-            for path, summary in all_summaries.items()
-            if _direct_parent(path) == parent_path and path != parent_path
-        ]
-        if not direct_children:
-            continue
-
-        # Compute and cache this parent's aggregate summary.
-        all_summaries[parent_path] = _aggregate_summary(parent_path, direct_children)
-
-        await manifest_store.rebuild_parent(parent_path, direct_children)
-
-
-def _naive(dt: datetime) -> datetime:
-    """Return a timezone-naive datetime for ordering.
-
-    Strips tzinfo so that min()/max() can compare a mix of aware and naive
-    datetimes without raising TypeError.  The original value (with or without
-    tzinfo) is preserved in the PartitionSummary; only the key is stripped.
-    """
-    return dt.replace(tzinfo=None)
-
-
-def _aggregate_summary(
-    path: str,
-    children: list[PartitionSummary],
-    field_config: list[FieldDef] | None = None,
-) -> PartitionSummary:
-    """Aggregate child summaries into a single parent-level summary."""
-    if field_config is None:
-        field_config = PHOTO_FIELDS
-    stats: dict = {}
-    for fdef in field_config:
-        if fdef.summary_range:
-            child_stats = [s for c in children if (s := c._stats.get(fdef.name)) is not None]
-            mins  = [s["min"]  for s in child_stats if s.get("min")  is not None]
-            maxes = [s["max"] for s in child_stats if s.get("max") is not None]
-            if not mins and not maxes:
-                continue
-            if fdef.type == FieldType.DATE_RANGE:
-                stats[fdef.name] = {"type": "date_range", "min": min(mins, key=_naive) if mins else None, "max": max(maxes, key=_naive) if maxes else None}
-            elif fdef.type == FieldType.INT_RANGE:
-                stats[fdef.name] = {"type": "int_range", "min": min(mins) if mins else None, "max": max(maxes) if maxes else None}
-        elif fdef.summary_gps_bbox and fdef.type is FieldType.GPS_BOX:
-            child_stats = [s for c in children if (s := c._stats.get(fdef.name)) is not None]
-            min_lats = [s["minLat"] for s in child_stats if s.get("minLat") is not None]
-            max_lats = [s["maxLat"] for s in child_stats if s.get("maxLat") is not None]
-            min_lons = [s["minLon"] for s in child_stats if s.get("minLon") is not None]
-            max_lons = [s["maxLon"] for s in child_stats if s.get("maxLon") is not None]
-            if min_lats:
-                stats[fdef.name] = {
-                    "type": "gps_bbox",
-                    "minLat": min(min_lats), "maxLat": max(max_lats),
-                    "minLon": min(min_lons), "maxLon": max(max_lons),
-                }
-    return PartitionSummary(path=path, photo_count=sum(c.photo_count for c in children), _stats=stats)
 
 
 # ---------------------------------------------------------------------------
@@ -403,70 +291,8 @@ async def _extract_one(
         photo_path, force=force_extract_exif
     )
     filename = PurePath(photo_path).name
-    entry = _sidecar_to_entry(filename, sidecar, sidecar.content_hash or "", str(version.value))
+    entry = PhotoEntry.from_sidecar(filename, sidecar, sidecar.content_hash or "", str(version.value))
     return entry, created
-
-
-
-def _sidecar_to_entry(
-    filename: str,
-    sidecar: XmpSidecar,
-    content_hash: str,
-    xmp_version_token: str,
-    field_config: list[FieldDef] | None = None,
-) -> PhotoEntry:
-    """Convert an XmpSidecar to a PhotoEntry for the leaf manifest."""
-    if field_config is None:
-        field_config = PHOTO_FIELDS
-    
-    # Build searchable dict
-    searchable: dict = {}
-    for fdef in field_config:
-        if fdef.sidecar_attr is not None:
-            val = getattr(sidecar, fdef.sidecar_attr, None)
-            if fdef.type == FieldType.STRING_COLLECTION and val is not None:
-                val = list(val)  # defensive copy
-            searchable[fdef.entry_attr] = val
-
-    # Compose the PhotoEntry
-    return PhotoEntry(
-        filename=filename,
-        content_hash=content_hash,
-        metadata_version=sidecar.metadata_version,
-        xmp_version_token=xmp_version_token,
-        searchable=searchable,
-    )
-
-
-def _compute_summary(
-    partition: str,
-    entries: list[PhotoEntry],
-    field_config: list[FieldDef] | None = None,
-) -> PartitionSummary:
-    """Compute partition-level summary statistics from photo entries."""
-    if field_config is None:
-        field_config = PHOTO_FIELDS
-    stats: dict = {}
-    for fdef in field_config:
-        if fdef.summary_range:
-            values = [v for e in entries if (v := e.searchable.get(fdef.entry_attr)) is not None]
-            if not values:
-                continue
-            if fdef.type == FieldType.DATE_RANGE:
-                stats[fdef.name] = {"type": "date_range", "min": min(values, key=_naive), "max": max(values, key=_naive)}
-            elif fdef.type == FieldType.INT_RANGE:
-                stats[fdef.name] = {"type": "int_range", "min": min(values), "max": max(values)}
-        elif fdef.summary_gps_bbox and fdef.type is FieldType.GPS_BOX:
-            values = [v for e in entries if (v := e.searchable.get(fdef.entry_attr)) is not None]
-            if values:
-                lats = [v[0] for v in values]
-                lons = [v[1] for v in values]
-                stats[fdef.name] = {
-                    "type": "gps_bbox",
-                    "minLat": min(lats), "maxLat": max(lats),
-                    "minLon": min(lons), "maxLon": max(lons),
-                }
-    return PartitionSummary(path=partition, photo_count=len(entries), _stats=stats)
 
 
 async def _upsert_leaf_manifest(
@@ -474,13 +300,13 @@ async def _upsert_leaf_manifest(
     partition: str,
     photo_entries: list[PhotoEntry],
     thumbnail_result: "ThumbnailResult | None" = None,
-) -> PartitionSummary:
+) -> ManifestSummary:
     """Create or update the leaf manifest for the partition.
 
     Returns:
-        The PartitionSummary written into the manifest.
+        The ManifestSummary written into the Root Summary.
     """
-    summary = _compute_summary(partition, photo_entries)
+    summary = ManifestSummary.from_photos(partition, photo_entries)
     manifest = LeafManifest(
         schema_version=SCHEMA_VERSION,
         partition=partition,
