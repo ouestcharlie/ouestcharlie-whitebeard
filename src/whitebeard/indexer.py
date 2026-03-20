@@ -108,9 +108,10 @@ async def index_partition(
             "Vacations/Italy 2023/" for a subfolder). Trailing slash optional.
         force_extract_exif: If True, re-extract EXIF and overwrite existing
             XMP sidecars.  If False (default), existing sidecars are reused.
-        generate_thumbnails: If True, generate thumbnail and preview AVIF
-            containers after indexing.  Requires the avif-grid binary.
+        generate_thumbnails: If True, generate the thumbnail AVIF container
+            after indexing.  Requires the image-proc binary.
             Defaults to False; the MCP agent sets this to True.
+            Preview JPEGs are generated lazily on-demand by Wally HTTP.
 
     Returns:
         IndexResult with counts of processed, created, skipped, and failed photos.
@@ -144,12 +145,14 @@ async def index_partition(
             result.errors += 1
             result.error_details.append(f"{filename}: {exc}")
 
-    # Generate thumbnail and preview AVIF containers.
+    # Generate thumbnail AVIF container
     thumbnail_result = None
     if generate_thumbnails and photo_entries:
         try:
             from ouestcharlie_toolkit.thumbnail_builder import generate_partition_thumbnails
-            thumbnail_result = await generate_partition_thumbnails(backend, partition, photo_entries)
+            thumbnail_result = await generate_partition_thumbnails(
+                backend, partition, photo_entries, tiers=["thumbnail"]
+            )
             result.thumbnails_rebuilt = True
         except Exception as exc:
             _log.error(
@@ -315,18 +318,14 @@ async def _upsert_leaf_manifest(
     )
     if thumbnail_result is not None:
         manifest.thumbnails_hash = thumbnail_result.thumbnails_hash
-        manifest.previews_hash = thumbnail_result.previews_hash
         manifest.thumbnail_grid = thumbnail_result.thumbnail_grid
-        manifest.preview_grid = thumbnail_result.preview_grid
     try:
         existing, version = await manifest_store.read_leaf(partition)
         manifest._extra = existing._extra  # preserve unknown fields
-        # Preserve existing thumbnail hashes if we didn't regenerate thumbnails.
+        # Preserve existing thumbnail hash/grid if we didn't regenerate thumbnails.
         if thumbnail_result is None:
             manifest.thumbnails_hash = existing.thumbnails_hash
-            manifest.previews_hash = existing.previews_hash
             manifest.thumbnail_grid = existing.thumbnail_grid
-            manifest.preview_grid = existing.preview_grid
         await manifest_store.write_leaf(manifest, version)
     except FileNotFoundError:
         await manifest_store.create_leaf(manifest)
