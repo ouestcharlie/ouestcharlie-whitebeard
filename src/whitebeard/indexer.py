@@ -20,7 +20,7 @@ from ouestcharlie_toolkit.schema import (
     LeafManifest,
     ManifestSummary,
     PhotoEntry,
-    ThumbnailGridLayout,
+    ThumbnailChunk,
 )
 
 from ouestcharlie_toolkit.xmp import XmpStore
@@ -160,9 +160,8 @@ async def index_partition(
             result.error_details.append(f"thumbnails: {exc}")
 
     # Build or update the leaf manifest.
-    grid, t_hash = thumbnail_result if thumbnail_result is not None else (None, None)
     result.summary = await _upsert_leaf_manifest(
-        manifest_store, partition, photo_entries, grid, t_hash
+        manifest_store, partition, photo_entries, thumbnail_result
     )
 
     # Update the backend-wide summary.json with this partition's new summary.
@@ -300,16 +299,13 @@ async def _upsert_leaf_manifest(
     manifest_store: ManifestStore,
     partition: str,
     photo_entries: list[PhotoEntry],
-    thumbnail_grid: ThumbnailGridLayout | None = None,
-    thumbnails_hash: str | None = None,
+    thumbnail_chunks: list[ThumbnailChunk] | None = None,
 ) -> ManifestSummary:
     """Create or update the leaf manifest for the partition.
 
     Args:
-        thumbnail_grid: Grid layout from ``generate_partition_thumbnails``,
+        thumbnail_chunks: List of chunks from ``generate_partition_thumbnails``,
             or ``None`` to preserve the existing value.
-        thumbnails_hash: Content hash of the AVIF file, or ``None`` to
-            preserve the existing value.
 
     Returns:
         The ManifestSummary written into the Root Summary.
@@ -324,13 +320,13 @@ async def _upsert_leaf_manifest(
     try:
         existing, version = await manifest_store.read_leaf(partition)
         manifest._extra = existing._extra  # preserve unknown fields
-        if thumbnail_grid is not None:
-            manifest.thumbnail_grid = thumbnail_grid
-            manifest.thumbnails_hash = thumbnails_hash
+        if thumbnail_chunks is not None:
+            manifest.thumbnail_chunks = thumbnail_chunks
         else:
-            manifest.thumbnail_grid = existing.thumbnail_grid
-            manifest.thumbnails_hash = existing.thumbnails_hash
+            manifest.thumbnail_chunks = existing.thumbnail_chunks
         await manifest_store.write_leaf(manifest, version)
     except FileNotFoundError:
+        if thumbnail_chunks is not None:
+            manifest.thumbnail_chunks = thumbnail_chunks
         await manifest_store.create_leaf(manifest)
     return summary
