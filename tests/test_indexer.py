@@ -83,7 +83,7 @@ async def test_index_sidecar_has_content_hash(backend_with_sample: LocalBackend,
     await index_partition(backend_with_sample, "")
     sidecar = parse_xmp((tmpdir / "001.xmp").read_text(encoding="utf-8"))
     assert sidecar.content_hash is not None
-    assert sidecar.content_hash.startswith("sha256:")
+    assert len(sidecar.content_hash) == 22
 
 
 @pytest.mark.asyncio
@@ -117,7 +117,7 @@ async def test_index_manifest_photo_entry(backend_with_sample: LocalBackend, tmp
     assert len(data["photos"]) == 1
     entry = data["photos"][0]
     assert entry["filename"] == "001.jpg"
-    assert entry["contentHash"].startswith("sha256:")
+    assert len(entry["contentHash"]) == 22
 
 
 @pytest.mark.asyncio
