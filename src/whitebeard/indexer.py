@@ -20,12 +20,9 @@ from ouestcharlie_toolkit.schema import (
     LeafManifest,
     ManifestSummary,
     PhotoEntry,
+    ThumbnailGridLayout,
 )
 
-# TYPE_CHECKING import for ThumbnailResult avoids circular imports at runtime.
-from typing import TYPE_CHECKING
-if TYPE_CHECKING:
-    from ouestcharlie_toolkit.thumbnail_builder import ThumbnailResult
 from ouestcharlie_toolkit.xmp import XmpStore
 
 
@@ -151,7 +148,7 @@ async def index_partition(
         try:
             from ouestcharlie_toolkit.thumbnail_builder import generate_partition_thumbnails
             thumbnail_result = await generate_partition_thumbnails(
-                backend, partition, photo_entries, tiers=["thumbnail"]
+                backend, partition, photo_entries, tier="thumbnail"
             )
             result.thumbnails_rebuilt = True
         except Exception as exc:
@@ -163,8 +160,9 @@ async def index_partition(
             result.error_details.append(f"thumbnails: {exc}")
 
     # Build or update the leaf manifest.
+    grid, t_hash = thumbnail_result if thumbnail_result is not None else (None, None)
     result.summary = await _upsert_leaf_manifest(
-        manifest_store, partition, photo_entries, thumbnail_result
+        manifest_store, partition, photo_entries, grid, t_hash
     )
 
     # Update the backend-wide summary.json with this partition's new summary.
@@ -302,9 +300,16 @@ async def _upsert_leaf_manifest(
     manifest_store: ManifestStore,
     partition: str,
     photo_entries: list[PhotoEntry],
-    thumbnail_result: "ThumbnailResult | None" = None,
+    thumbnail_grid: ThumbnailGridLayout | None = None,
+    thumbnails_hash: str | None = None,
 ) -> ManifestSummary:
     """Create or update the leaf manifest for the partition.
+
+    Args:
+        thumbnail_grid: Grid layout from ``generate_partition_thumbnails``,
+            or ``None`` to preserve the existing value.
+        thumbnails_hash: Content hash of the AVIF file, or ``None`` to
+            preserve the existing value.
 
     Returns:
         The ManifestSummary written into the Root Summary.
@@ -316,16 +321,15 @@ async def _upsert_leaf_manifest(
         photos=photo_entries,
         summary=summary,
     )
-    if thumbnail_result is not None:
-        manifest.thumbnails_hash = thumbnail_result.thumbnails_hash
-        manifest.thumbnail_grid = thumbnail_result.thumbnail_grid
     try:
         existing, version = await manifest_store.read_leaf(partition)
         manifest._extra = existing._extra  # preserve unknown fields
-        # Preserve existing thumbnail hash/grid if we didn't regenerate thumbnails.
-        if thumbnail_result is None:
-            manifest.thumbnails_hash = existing.thumbnails_hash
+        if thumbnail_grid is not None:
+            manifest.thumbnail_grid = thumbnail_grid
+            manifest.thumbnails_hash = thumbnails_hash
+        else:
             manifest.thumbnail_grid = existing.thumbnail_grid
+            manifest.thumbnails_hash = existing.thumbnails_hash
         await manifest_store.write_leaf(manifest, version)
     except FileNotFoundError:
         await manifest_store.create_leaf(manifest)

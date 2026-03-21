@@ -132,7 +132,7 @@ async def profile_steps(backend_root: str, partition: str) -> None:
     backend.totals.clear(); backend.counts.clear()
     t0 = time.perf_counter()
     thumbnail_result = await generate_partition_thumbnails(
-        backend, partition, photo_entries, tiers=["thumbnail"]
+        backend, partition, photo_entries, tier="thumbnail"
     )
     t_thumbnails = time.perf_counter() - t0
     print(f"Thumbnails: {t_thumbnails*1000:6.1f} ms")
@@ -141,7 +141,8 @@ async def profile_steps(backend_root: str, partition: str) -> None:
     # ── Step 4: Manifest write ────────────────────────────────────────────────
     backend.totals.clear(); backend.counts.clear()
     t0 = time.perf_counter()
-    summary = await _upsert_leaf_manifest(manifest_store, partition, photo_entries, thumbnail_result)
+    grid, t_hash = thumbnail_result if thumbnail_result is not None else (None, None)
+    summary = await _upsert_leaf_manifest(manifest_store, partition, photo_entries, grid, t_hash)
     t_manifest = time.perf_counter() - t0
     print(f"Manifest:   {t_manifest*1000:6.1f} ms")
     print(backend.report())
