@@ -17,19 +17,27 @@ tests/
   test_indexer.py
 ```
 
-## Running Tests
+## Installation
 
-Whitebeard shares the same venv problem as the py-toolkit (rawpy has no macOS x86_64 wheel).
+### From PyPI (recommended)
 
-**Venv setup (first time):**
 ```bash
-cd /Users/antoinehue/Code/charlie/ouestcharlie-whitebeard
-uv venv
-.venv/bin/pip install -e ../ouestcharlie-py-toolkit
-.venv/bin/pip install -e ".[dev]"
+pip install whitebeard
 ```
 
-**Running tests:**
+### From source (development)
+
+Requires the sibling `ouestcharlie-py-toolkit` repo and a built `image-proc` binary (see its README_DEV.md):
+
+```bash
+uv venv
+uv sync
+```
+
+## Running Tests
+
+**Always use `.venv/bin/python -m pytest`:**
+
 ```bash
 .venv/bin/python -m pytest tests/ -v
 ```
