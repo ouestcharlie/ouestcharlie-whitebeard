@@ -10,6 +10,7 @@ Example:
 Output: prints step-level summary to stdout, saves full cProfile to
 profile_indexing_<partition_slug>.txt in the current directory.
 """
+
 import asyncio
 import cProfile
 import io
@@ -22,6 +23,7 @@ from pathlib import PurePath
 from ouestcharlie_toolkit.backends.local import LocalBackend
 from ouestcharlie_toolkit.manifest import ManifestStore
 from ouestcharlie_toolkit.xmp import XmpStore
+
 from whitebeard.indexer import (
     _extract_one,
     _filter_photo_files,
@@ -41,9 +43,11 @@ class TimingBackend:
         class _ctx:
             def __enter__(ctx):
                 ctx._t0 = time.perf_counter()
+
             def __exit__(ctx, *_):
                 self.totals[name] += time.perf_counter() - ctx._t0
                 self.counts[name] += 1
+
         return _ctx()
 
     # ── Forwarded methods ─────────────────────────────────────────────────────
@@ -82,7 +86,7 @@ class TimingBackend:
             ms = self.totals[op] * 1000
             n = self.counts[op]
             if n:
-                lines.append(f"    {op:<20} {ms:7.1f} ms  ({n}×  avg {ms/n:.1f} ms)")
+                lines.append(f"    {op:<20} {ms:7.1f} ms  ({n}×  avg {ms / n:.1f} ms)")
         total_ms = sum(self.totals.values()) * 1000
         lines.append(f"    {'TOTAL':<20} {total_ms:7.1f} ms")
         return "\n".join(lines)
@@ -100,10 +104,11 @@ async def profile_steps(backend_root: str, partition: str) -> None:
     photo_files = _filter_photo_files(all_files, partition)
     t_discovery = time.perf_counter() - t0
     n = len(photo_files)
-    print(f"Discovery:  {t_discovery*1000:6.1f} ms  ({n} photos)")
+    print(f"Discovery:  {t_discovery * 1000:6.1f} ms  ({n} photos)")
 
     # ── Step 2: EXIF extraction + XMP write (force) ──────────────────────────
-    backend.totals.clear(); backend.counts.clear()
+    backend.totals.clear()
+    backend.counts.clear()
     photo_entries = []
     t_exif_total = 0.0
     per_photo = []
@@ -118,9 +123,9 @@ async def profile_steps(backend_root: str, partition: str) -> None:
         t_exif_total += elapsed
         per_photo.append((PurePath(fi.path).name, elapsed * 1000))
 
-    print(f"EXIF+XMP:   {t_exif_total*1000:6.1f} ms  total")
+    print(f"EXIF+XMP:   {t_exif_total * 1000:6.1f} ms  total")
     if n:
-        print(f"            {t_exif_total*1000/n:6.1f} ms  avg/photo")
+        print(f"            {t_exif_total * 1000 / n:6.1f} ms  avg/photo")
     per_photo.sort(key=lambda x: -x[1])
     print("  Slowest 5 photos:")
     for name, ms in per_photo[:5]:
@@ -129,33 +134,39 @@ async def profile_steps(backend_root: str, partition: str) -> None:
 
     # ── Step 3: Thumbnail generation ─────────────────────────────────────────
     from ouestcharlie_toolkit.thumbnail_builder import generate_partition_thumbnails
-    backend.totals.clear(); backend.counts.clear()
+
+    backend.totals.clear()
+    backend.counts.clear()
     t0 = time.perf_counter()
     thumbnail_result = await generate_partition_thumbnails(
         backend, partition, photo_entries, tier="thumbnail"
     )
     t_thumbnails = time.perf_counter() - t0
-    print(f"Thumbnails: {t_thumbnails*1000:6.1f} ms")
+    print(f"Thumbnails: {t_thumbnails * 1000:6.1f} ms")
     print(backend.report())
 
     # ── Step 4: Manifest write ────────────────────────────────────────────────
-    backend.totals.clear(); backend.counts.clear()
+    backend.totals.clear()
+    backend.counts.clear()
     t0 = time.perf_counter()
-    summary = await _upsert_leaf_manifest(manifest_store, partition, photo_entries, thumbnail_result)
+    summary = await _upsert_leaf_manifest(
+        manifest_store, partition, photo_entries, thumbnail_result
+    )
     t_manifest = time.perf_counter() - t0
-    print(f"Manifest:   {t_manifest*1000:6.1f} ms")
+    print(f"Manifest:   {t_manifest * 1000:6.1f} ms")
     print(backend.report())
 
     # ── Step 5: Summary.json update ──────────────────────────────────────────
-    backend.totals.clear(); backend.counts.clear()
+    backend.totals.clear()
+    backend.counts.clear()
     t0 = time.perf_counter()
     await manifest_store.upsert_partition_in_summary(summary)
     t_summary = time.perf_counter() - t0
-    print(f"Summary:    {t_summary*1000:6.1f} ms")
+    print(f"Summary:    {t_summary * 1000:6.1f} ms")
     print(backend.report())
 
     total = t_discovery + t_exif_total + t_thumbnails + t_manifest + t_summary
-    print(f"\nTotal:      {total*1000:6.1f} ms")
+    print(f"\nTotal:      {total * 1000:6.1f} ms")
 
 
 def main() -> None:
@@ -167,13 +178,12 @@ def main() -> None:
     out_path = f"profile_indexing_{slug}.txt"
 
     header = (
-        f"=== Step-level timing (force EXIF) ===\n"
-        f"Backend: {backend_root}  Partition: {partition}\n"
+        f"=== Step-level timing (force EXIF) ===\nBackend: {backend_root}  Partition: {partition}\n"
     )
     print(f"\n{header}")
     asyncio.run(profile_steps(backend_root, partition))
 
-    print(f"\n\n=== cProfile (top 40 by own time) ===\n")
+    print("\n\n=== cProfile (top 40 by own time) ===\n")
     pr = cProfile.Profile()
     pr.enable()
     asyncio.run(profile_steps(backend_root, partition))

@@ -5,19 +5,16 @@ from __future__ import annotations
 import json
 import logging
 import shutil
-import tempfile
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
-
 from ouestcharlie_toolkit.backends.local import LocalBackend
-from ouestcharlie_toolkit.schema import METADATA_DIR, manifest_path, summary_path
-from ouestcharlie_toolkit.xmp import parse_xmp, xmp_path_for
+from ouestcharlie_toolkit.schema import METADATA_DIR
+from ouestcharlie_toolkit.xmp import parse_xmp
 
 from whitebeard.indexer import (
-    PHOTO_EXTENSIONS,
     IndexResult,
     LibraryIndexResult,
     index_library,
@@ -34,11 +31,7 @@ _SAMPLE_JPG = (
 )
 
 # Minimal valid JPEG (SOI + JFIF APP0 + EOI) — no EXIF data.
-_MINIMAL_JPEG = (
-    b"\xff\xd8"
-    b"\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00"
-    b"\xff\xd9"
-)
+_MINIMAL_JPEG = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00\xff\xd9"
 
 
 # ---------------------------------------------------------------------------
@@ -78,7 +71,9 @@ async def test_index_creates_xmp_sidecar(backend_with_sample: LocalBackend, tmpd
 
 
 @pytest.mark.asyncio
-async def test_index_sidecar_has_content_hash(backend_with_sample: LocalBackend, tmpdir: Path) -> None:
+async def test_index_sidecar_has_content_hash(
+    backend_with_sample: LocalBackend, tmpdir: Path
+) -> None:
     """The created XMP sidecar contains an ouestcharlie:contentHash."""
     await index_partition(backend_with_sample, "")
     sidecar = parse_xmp((tmpdir / "001.xmp").read_text(encoding="utf-8"))
@@ -87,7 +82,9 @@ async def test_index_sidecar_has_content_hash(backend_with_sample: LocalBackend,
 
 
 @pytest.mark.asyncio
-async def test_index_sidecar_has_camera_fields(backend_with_sample: LocalBackend, tmpdir: Path) -> None:
+async def test_index_sidecar_has_camera_fields(
+    backend_with_sample: LocalBackend, tmpdir: Path
+) -> None:
     """The created XMP sidecar contains make/model extracted from EXIF."""
     await index_partition(backend_with_sample, "")
     sidecar = parse_xmp((tmpdir / "001.xmp").read_text(encoding="utf-8"))
@@ -142,7 +139,7 @@ async def test_index_manifest_has_date(backend_with_sample: LocalBackend, tmpdir
 @pytest.mark.asyncio
 async def test_index_manifest_summary_rating_range(tmpdir: Path) -> None:
     """Leaf manifest summary has ratingMin/ratingMax when photos have ratings."""
-    from ouestcharlie_toolkit.schema import PhotoEntry, XmpSidecar, VersionToken
+    from ouestcharlie_toolkit.schema import PhotoEntry, XmpSidecar
 
     (tmpdir / "a.jpg").write_bytes(_MINIMAL_JPEG)
     (tmpdir / "b.jpg").write_bytes(_MINIMAL_JPEG)
@@ -157,7 +154,9 @@ async def test_index_manifest_summary_rating_range(tmpdir: Path) -> None:
         r = ratings[call_count]
         call_count += 1
         sidecar = XmpSidecar(content_hash=f"sha256:{'0' * 63}{call_count}", rating=r)
-        entry = PhotoEntry.from_sidecar(photo_path.split("/")[-1], sidecar, sidecar.content_hash, "1")
+        entry = PhotoEntry.from_sidecar(
+            photo_path.split("/")[-1], sidecar, sidecar.content_hash, "1"
+        )
         return entry, True
 
     with patch("whitebeard.indexer._extract_one", side_effect=fake_process):
@@ -191,7 +190,9 @@ async def test_index_manifest_summary_no_rating_when_unrated(tmpdir: Path) -> No
 
 
 @pytest.mark.asyncio
-async def test_index_skips_existing_sidecar(backend_with_sample: LocalBackend, tmpdir: Path) -> None:
+async def test_index_skips_existing_sidecar(
+    backend_with_sample: LocalBackend, tmpdir: Path
+) -> None:
     """Without force, an existing XMP sidecar is not overwritten."""
     sentinel = "<!-- sentinel -->"
     xmp_path = tmpdir / "001.xmp"
@@ -205,14 +206,16 @@ async def test_index_skips_existing_sidecar(backend_with_sample: LocalBackend, t
 
 
 @pytest.mark.asyncio
-async def test_index_force_overwrites_sidecar(backend_with_sample: LocalBackend, tmpdir: Path) -> None:
+async def test_index_force_overwrites_sidecar(
+    backend_with_sample: LocalBackend, tmpdir: Path
+) -> None:
     """With force=True, an existing XMP sidecar is replaced with fresh EXIF data."""
     # First index run creates the sidecar.
     await index_partition(backend_with_sample, "")
 
     # Overwrite the sidecar with a sentinel.
     xmp_path = tmpdir / "001.xmp"
-    original_content = xmp_path.read_text(encoding="utf-8")
+    # original_content = xmp_path.read_text(encoding="utf-8")
     xmp_path.write_text("<!-- overwritten -->", encoding="utf-8")
 
     result = await index_partition(backend_with_sample, "", force_extract_exif=True)
@@ -479,12 +482,11 @@ async def test_index_partition_logs_error_on_photo_failure(tmpdir: Path, caplog)
     (tmpdir / "broken.jpg").write_bytes(_MINIMAL_JPEG)
     backend = LocalBackend(root=str(tmpdir))
 
-    with patch(
-        "whitebeard.indexer._extract_one",
-        side_effect=RuntimeError("simulated failure"),
+    with (
+        patch("whitebeard.indexer._extract_one", side_effect=RuntimeError("simulated failure")),
+        caplog.at_level(logging.ERROR, logger="whitebeard.indexer"),
     ):
-        with caplog.at_level(logging.ERROR, logger="whitebeard.indexer"):
-            result = await index_partition(backend, "")
+        result = await index_partition(backend, "")
 
     assert result.errors == 1
     assert any("simulated failure" in msg for msg in caplog.messages)
@@ -504,8 +506,9 @@ async def test_index_mixed_timezone_photos(tmpdir: Path) -> None:
     Regression test: min()/max() over a mixed list raises TypeError without the
     _naive() key function.
     """
-    from datetime import timezone, timedelta
-    from ouestcharlie_toolkit.schema import PhotoEntry, XmpSidecar, VersionToken
+    from datetime import timedelta, timezone
+
+    from ouestcharlie_toolkit.schema import PhotoEntry, VersionToken, XmpSidecar
 
     naive_dt = datetime(2024, 7, 1, 12, 0, 0)
     aware_dt = datetime(2024, 7, 2, 12, 0, 0, tzinfo=timezone(timedelta(hours=2)))
@@ -522,7 +525,9 @@ async def test_index_mixed_timezone_photos(tmpdir: Path) -> None:
         dt = naive_dt if call_count == 1 else aware_dt
         sidecar = XmpSidecar(content_hash=f"sha256:{'0' * 64}", date_taken=dt)
         token = VersionToken(value=1)
-        entry = PhotoEntry.from_sidecar(photo_path.split("/")[-1], sidecar, sidecar.content_hash, str(token.value))
+        entry = PhotoEntry.from_sidecar(
+            photo_path.split("/")[-1], sidecar, sidecar.content_hash, str(token.value)
+        )
         return entry, True
 
     with patch("whitebeard.indexer._extract_one", side_effect=fake_process):

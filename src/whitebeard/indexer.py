@@ -4,13 +4,10 @@ from __future__ import annotations
 
 import logging
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Generator
 from dataclasses import dataclass, field
-from pathlib import PurePath
 from itertools import chain
-from typing import Generator
-
-_log = logging.getLogger(__name__)
+from pathlib import PurePath
 
 from ouestcharlie_toolkit.backend import Backend
 from ouestcharlie_toolkit.manifest import ManifestStore
@@ -22,17 +19,28 @@ from ouestcharlie_toolkit.schema import (
     PhotoEntry,
     ThumbnailChunk,
 )
-
 from ouestcharlie_toolkit.xmp import XmpStore
 
+_log = logging.getLogger(__name__)
 
 # Photo file extensions indexed by Whitebeard (case-insensitive).
-PHOTO_EXTENSIONS: frozenset[str] = frozenset({
-    ".jpg", ".jpeg",
-    ".heic", ".heif",
-    ".png",
-    ".dng", ".cr2", ".cr3", ".nef", ".arw", ".raf", ".orf", ".rw2",
-})
+PHOTO_EXTENSIONS: frozenset[str] = frozenset(
+    {
+        ".jpg",
+        ".jpeg",
+        ".heic",
+        ".heif",
+        ".png",
+        ".dng",
+        ".cr2",
+        ".cr3",
+        ".nef",
+        ".arw",
+        ".raf",
+        ".orf",
+        ".rw2",
+    }
+)
 
 
 @dataclass
@@ -137,7 +145,10 @@ async def index_partition(
         except Exception as exc:
             _log.error(
                 "Failed to process photo — partition=%r file=%r: %s",
-                partition, filename, exc, exc_info=True
+                partition,
+                filename,
+                exc,
+                exc_info=True,
             )
             result.errors += 1
             result.error_details.append(f"{filename}: {exc}")
@@ -146,7 +157,10 @@ async def index_partition(
     thumbnail_result = None
     if generate_thumbnails and photo_entries:
         try:
-            from ouestcharlie_toolkit.thumbnail_builder import generate_partition_thumbnails
+            from ouestcharlie_toolkit.thumbnail_builder import (
+                generate_partition_thumbnails,
+            )
+
             thumbnail_result = await generate_partition_thumbnails(
                 backend, partition, photo_entries, tier="thumbnail"
             )
@@ -154,7 +168,9 @@ async def index_partition(
         except Exception as exc:
             _log.error(
                 "Thumbnail generation failed — partition=%r: %s",
-                partition, exc, exc_info=True,
+                partition,
+                exc,
+                exc_info=True,
             )
             result.errors += 1
             result.error_details.append(f"thumbnails: {exc}")
@@ -171,7 +187,9 @@ async def index_partition(
         except Exception as exc:
             _log.error(
                 "Failed to update summary.json — partition=%r: %s",
-                partition, exc, exc_info=True,
+                partition,
+                exc,
+                exc_info=True,
             )
             result.errors += 1
             result.error_details.append(f"summary.json update: {exc}")
@@ -216,12 +234,20 @@ async def index_library(
     total_partitions = len(sorted_partitions)
     for i, partition in enumerate(sorted_partitions):
         partition_result = await index_partition(
-            backend, partition, force_extract_exif,
+            backend,
+            partition,
+            force_extract_exif,
             generate_thumbnails=generate_thumbnails,
         )
         library_result.partitions.append(partition_result)
         if on_progress is not None:
-            await on_progress(i + 1, total_partitions, partition, partition_result.duration_ms, partition_result.photos_processed)
+            await on_progress(
+                i + 1,
+                total_partitions,
+                partition,
+                partition_result.duration_ms,
+                partition_result.photos_processed,
+            )
 
     return library_result
 
@@ -245,11 +271,9 @@ def _discover_leaf_partitions(files: list, root: str) -> set[str]:
         if PurePath(f.path).suffix.lower() not in PHOTO_EXTENSIONS:
             continue
         slash_pos = f.path.rfind("/")
-        if slash_pos == -1:
-            # Photo at top level; partition is the root itself.
-            parent = root
-        else:
-            parent = f.path[:slash_pos]
+
+        # Photo at top level; partition is the root itself.
+        parent = root if slash_pos == -1 else f.path[:slash_pos]
         leaf_partitions.add(parent)
     return leaf_partitions
 
@@ -268,7 +292,7 @@ def _filter_photo_files(
     result = []
     for f in files:
         # Strip partition prefix to get the filename relative to the partition.
-        rel = f.path[len(prefix):] if f.path.startswith(prefix) else f.path
+        rel = f.path[len(prefix) :] if f.path.startswith(prefix) else f.path
         # Direct child: no directory separator in the relative part.
         if "/" in rel:
             continue
@@ -291,7 +315,9 @@ async def _extract_one(
         photo_path, force=force_extract_exif
     )
     filename = PurePath(photo_path).name
-    entry = PhotoEntry.from_sidecar(filename, sidecar, sidecar.content_hash or "", str(version.value))
+    entry = PhotoEntry.from_sidecar(
+        filename, sidecar, sidecar.content_hash or "", str(version.value)
+    )
     return entry, created
 
 
