@@ -8,6 +8,7 @@ from mcp.server.fastmcp import Context
 
 _log = logging.getLogger(__name__)
 
+from ouestcharlie_toolkit import report_progress
 from ouestcharlie_toolkit.server import AgentBase
 
 from .indexer import index_library, index_partition
@@ -117,10 +118,7 @@ class WhitebeardAgent(AgentBase):
             """
             async def _library_progress(current: int, total: int, name: str, duration_ms: int = 0, photos: int = 0) -> None:
                 message = f"{name} — {photos} photos ({duration_ms}ms)" if duration_ms else name
-                try:
-                    await ctx.report_progress(progress=current, total=total, message=message)
-                except Exception as exc:
-                    _log.debug("Progress notification failed (client may have disconnected): %s", exc)
+                await report_progress(ctx, current, total, message)
 
             try:
                 result = await index_library(
