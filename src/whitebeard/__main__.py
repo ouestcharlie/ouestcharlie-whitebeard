@@ -21,7 +21,7 @@ from ouestcharlie_toolkit import setup_logging
 _log_file = setup_logging("whitebeard", log_file_env_var="WHITEBEARD_LOG_FILE", level=logging.DEBUG)
 logging.getLogger(__name__).info("Whitebeard starting — log: %s", _log_file)
 
-from whitebeard.agent import WhitebeardAgent  # noqa: E402
+from whitebeard.agent import WhitebeardAgent
 
 _agent = WhitebeardAgent()
 mcp = _agent.mcp  # module-level name required by `mcp dev`
