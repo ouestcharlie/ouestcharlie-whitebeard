@@ -8,20 +8,22 @@ version = "0.1.0"
 description = "OuEstCharlie Whitebeard — photo indexer agent for local drives"
 requires-python = ">=3.11"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE*"]
+authors = [
+    { name = "Antoine Hue" },
+]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Operating System :: OS Independent",
 ]
-license = "MIT"
 dependencies = [
     "ouestcharlie-toolkit>=0.1.0",
 ]
 
-[project.optional-dependencies]
-dev = [
-    "pytest>=8.0",
-    "pytest-asyncio>=0.23",
-]
+[project.urls]
+Homepage = "https://github.com/ouestcharlie/ouestcharlie-whitebeard"
+Issues = "https://github.com/ouestcharlie/ouestcharlie-whitebeard/issues"
 
 [project.scripts]
 whitebeard = "whitebeard.__main__:main"
