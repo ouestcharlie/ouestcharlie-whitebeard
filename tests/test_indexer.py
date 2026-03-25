@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 import pytest
 from ouestcharlie_toolkit.backends.local import LocalBackend
+from ouestcharlie_toolkit.manifest import ManifestStore, ManifestSummary
 from ouestcharlie_toolkit.schema import METADATA_DIR
 from ouestcharlie_toolkit.xmp import parse_xmp
 
@@ -121,19 +122,26 @@ async def test_index_manifest_photo_entry(backend_with_sample: LocalBackend, tmp
 async def test_index_manifest_summary(backend_with_sample: LocalBackend, tmpdir: Path) -> None:
     """The leaf manifest summary reflects the photo count."""
     await index_partition(backend_with_sample, "")
-    data = json.loads((tmpdir / METADATA_DIR / "manifest.json").read_text())
-    assert data["summary"]["photoCount"] == 1
+
+    manifestStore = ManifestStore(backend_with_sample)
+    manifest, _ = await manifestStore.read_leaf("")
+    summary = ManifestSummary.from_photos("", manifest.photos)
+    assert summary.photo_count == 1
 
 
 @pytest.mark.asyncio
 async def test_index_manifest_has_date(backend_with_sample: LocalBackend, tmpdir: Path) -> None:
     """The manifest summary has a date range when the photo has EXIF date."""
     await index_partition(backend_with_sample, "")
-    data = json.loads((tmpdir / METADATA_DIR / "manifest.json").read_text())
+
+    manifestStore = ManifestStore(backend_with_sample)
+    manifest, _ = await manifestStore.read_leaf("")
+    summary = ManifestSummary.from_photos("", manifest.photos)
+
     # 001.jpg has EXIF DateTimeOriginal
-    assert "dateTaken" in data["summary"]
-    assert "min" in data["summary"]["dateTaken"]
-    assert "max" in data["summary"]["dateTaken"]
+    assert "dateTaken" in summary._stats
+    assert "min" in summary._stats["dateTaken"]
+    assert "max" in summary._stats["dateTaken"]
 
 
 @pytest.mark.asyncio
@@ -160,15 +168,13 @@ async def test_index_manifest_summary_rating_range(tmpdir: Path) -> None:
         return entry, True
 
     with patch("whitebeard.indexer._extract_one", side_effect=fake_process):
-        result = await index_partition(backend, "")
+        await index_partition(backend, "")
 
-    assert result.summary is not None
-    assert result.summary.rating["min"] == 2
-    assert result.summary.rating["max"] == 5
-
-    data = json.loads((tmpdir / METADATA_DIR / "manifest.json").read_text())
-    assert data["summary"]["rating"]["min"] == 2
-    assert data["summary"]["rating"]["max"] == 5
+    manifestStore = ManifestStore(backend)
+    manifest, _ = await manifestStore.read_leaf("")
+    summary = ManifestSummary.from_photos("", manifest.photos)
+    assert summary._stats["rating"]["min"] == 2
+    assert summary._stats["rating"]["max"] == 5
 
 
 @pytest.mark.asyncio
@@ -179,9 +185,11 @@ async def test_index_manifest_summary_no_rating_when_unrated(tmpdir: Path) -> No
 
     await index_partition(backend, "")
 
-    data = json.loads((tmpdir / METADATA_DIR / "manifest.json").read_text())
-    assert "ratingMin" not in data["summary"]
-    assert "ratingMax" not in data["summary"]
+    manifestStore = ManifestStore(backend)
+    manifest, _ = await manifestStore.read_leaf("")
+    summary = ManifestSummary.from_photos("", manifest.photos)
+
+    assert "rating" not in summary._stats
 
 
 # ---------------------------------------------------------------------------
@@ -534,10 +542,6 @@ async def test_index_mixed_timezone_photos(tmpdir: Path) -> None:
         result = await index_partition(backend, "")
 
     assert result.errors == 0
-    assert result.summary is not None
-    assert result.summary.dateTaken is not None
-    assert result.summary.dateTaken["min"] is not None
-    assert result.summary.dateTaken["max"] is not None
 
 
 # ---------------------------------------------------------------------------

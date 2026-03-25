@@ -53,7 +53,6 @@ class IndexResult:
     sidecars_skipped: int = 0
     errors: int = 0
     error_details: list[str] = field(default_factory=list)
-    summary: ManifestSummary | None = None
     thumbnails_rebuilt: bool = False
     duration_ms: int = 0
 
@@ -176,14 +175,14 @@ async def index_partition(
             result.error_details.append(f"thumbnails: {exc}")
 
     # Build or update the leaf manifest.
-    result.summary = await _upsert_leaf_manifest(
+    summary = await _upsert_leaf_manifest(
         manifest_store, partition, photo_entries, thumbnail_result
     )
 
     # Update the backend-wide summary.json with this partition's new summary.
-    if result.summary is not None:
+    if summary is not None:
         try:
-            await manifest_store.upsert_partition_in_summary(result.summary)
+            await manifest_store.upsert_partition_in_summary(summary)
         except Exception as exc:
             _log.error(
                 "Failed to update summary.json — partition=%r: %s",
@@ -341,7 +340,6 @@ async def _upsert_leaf_manifest(
         schema_version=SCHEMA_VERSION,
         partition=partition,
         photos=photo_entries,
-        summary=summary,
     )
     try:
         existing, version = await manifest_store.read_leaf(partition)

@@ -27,7 +27,7 @@ class WhitebeardAgent(AgentBase):
     def _register_tools(self) -> None:
         mcp = self.mcp
 
-        @mcp.tool()
+        @mcp.tool(name="index_partition")
         async def index_partition_tool(
             ctx: Context,
             partition: str,
@@ -73,7 +73,7 @@ class WhitebeardAgent(AgentBase):
                 )
             except Exception as exc:
                 _log.error(
-                    "index_partition_tool failed — partition=%r: %s",
+                    "index_partition failed — partition=%r: %s",
                     partition,
                     exc,
                     exc_info=True,
@@ -90,7 +90,7 @@ class WhitebeardAgent(AgentBase):
                 "durationMs": result.duration_ms,
             }
 
-        @mcp.tool()
+        @mcp.tool(name="index_library")
         async def index_library_tool(
             ctx: Context,
             root: str = "",
@@ -142,7 +142,7 @@ class WhitebeardAgent(AgentBase):
                     on_progress=_library_progress,
                 )
             except Exception as exc:
-                _log.error("index_library_tool failed — root=%r: %s", root, exc, exc_info=True)
+                _log.error("index_library failed — root=%r: %s", root, exc, exc_info=True)
                 raise
             return {
                 "partitionsIndexed": len(result.partitions),
