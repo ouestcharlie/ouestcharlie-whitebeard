@@ -480,6 +480,7 @@ dependencies = [
     { name = "blake3" },
     { name = "mcp" },
     { name = "pyexiv2" },
+    { name = "pyjwt" },
 ]
 
 [package.metadata]
@@ -487,6 +488,7 @@ requires-dist = [
     { name = "blake3", specifier = ">=1.0.8" },
     { name = "mcp", specifier = ">=1.0" },
     { name = "pyexiv2", specifier = ">=2.8" },
+    { name = "pyjwt", specifier = ">=2.12.0" },
 ]
 
 [package.metadata.requires-dev]
@@ -495,6 +497,33 @@ dev = [
     { name = "pre-commit", specifier = ">=4.5.1" },
     { name = "pytest", specifier = ">=8.0" },
     { name = "pytest-asyncio", specifier = ">=0.23" },
+]
+
+[[package]]
+name = "ouestcharlie-whitebeard"
+version = "0.1.0"
+source = { editable = "." }
+dependencies = [
+    { name = "ouestcharlie-py-toolkit" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "mcp", extra = ["cli"] },
+    { name = "pre-commit" },
+    { name = "pytest" },
+    { name = "pytest-asyncio" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "ouestcharlie-py-toolkit", editable = "../ouestcharlie-py-toolkit" }]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "mcp", extras = ["cli"], specifier = ">=1.26.0" },
+    { name = "pre-commit", specifier = ">=4.5.1" },
+    { name = "pytest", specifier = ">=9.0.2" },
+    { name = "pytest-asyncio", specifier = ">=1.3.0" },
 ]
 
 [[package]]
@@ -713,11 +742,11 @@ wheels = [
 
 [[package]]
 name = "pyjwt"
-version = "2.11.0"
+version = "2.12.1"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/5c/5a/b46fa56bf322901eee5b0454a34343cdbdae202cd421775a8ee4e42fd519/pyjwt-2.11.0.tar.gz", hash = "sha256:35f95c1f0fbe5d5ba6e43f00271c275f7a1a4db1dab27bf708073b75318ea623", size = 98019, upload-time = "2026-01-30T19:59:55.694Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/c2/27/a3b6e5bf6ff856d2509292e95c8f57f0df7017cf5394921fc4e4ef40308a/pyjwt-2.12.1.tar.gz", hash = "sha256:c74a7a2adf861c04d002db713dd85f84beb242228e671280bf709d765b03672b", size = 102564, upload-time = "2026-03-13T19:27:37.25Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/6f/01/c26ce75ba460d5cd503da9e13b21a33804d38c2165dec7b716d06b13010c/pyjwt-2.11.0-py3-none-any.whl", hash = "sha256:94a6bde30eb5c8e04fee991062b534071fd1439ef58d2adc9ccb823e7bcd0469", size = 28224, upload-time = "2026-01-30T19:59:54.539Z" },
+    { url = "https://files.pythonhosted.org/packages/e5/7a/8dd906bd22e79e47397a61742927f6747fe93242ef86645ee9092e610244/pyjwt-2.12.1-py3-none-any.whl", hash = "sha256:28ca37c070cad8ba8cd9790cd940535d40274d22f80ab87f3ac6a713e6e8454c", size = 29726, upload-time = "2026-03-13T19:27:35.677Z" },
 ]
 
 [package.optional-dependencies]
@@ -1091,31 +1120,4 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/aa/92/58199fe10049f9703c2666e809c4f686c54ef0a68b0f6afccf518c0b1eb9/virtualenv-21.2.0.tar.gz", hash = "sha256:1720dc3a62ef5b443092e3f499228599045d7fea4c79199770499df8becf9098", size = 5840618, upload-time = "2026-03-09T17:24:38.013Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/c6/59/7d02447a55b2e55755011a647479041bc92a82e143f96a8195cb33bd0a1c/virtualenv-21.2.0-py3-none-any.whl", hash = "sha256:1bd755b504931164a5a496d217c014d098426cddc79363ad66ac78125f9d908f", size = 5825084, upload-time = "2026-03-09T17:24:35.378Z" },
-]
-
-[[package]]
-name = "whitebeard"
-version = "0.1.0"
-source = { editable = "." }
-dependencies = [
-    { name = "ouestcharlie-py-toolkit" },
-]
-
-[package.dev-dependencies]
-dev = [
-    { name = "mcp", extra = ["cli"] },
-    { name = "pre-commit" },
-    { name = "pytest" },
-    { name = "pytest-asyncio" },
-]
-
-[package.metadata]
-requires-dist = [{ name = "ouestcharlie-py-toolkit", editable = "../ouestcharlie-py-toolkit" }]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "mcp", extras = ["cli"], specifier = ">=1.26.0" },
-    { name = "pre-commit", specifier = ">=4.5.1" },
-    { name = "pytest", specifier = ">=9.0.2" },
-    { name = "pytest-asyncio", specifier = ">=1.3.0" },
 ]

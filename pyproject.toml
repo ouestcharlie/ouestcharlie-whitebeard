@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "whitebeard"
+name = "ouestcharlie-whitebeard"
 version = "0.1.0"
 description = "OuEstCharlie Whitebeard — photo indexer agent for local drives"
 requires-python = ">=3.11"
