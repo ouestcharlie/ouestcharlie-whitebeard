@@ -1,14 +1,14 @@
 """Standalone profiling script for index_partition.
 
-Usage:
-    .venv/bin/python profile_indexing.py <backend_root> <partition>
+Configuration is read from profiling/.env:
+    BACKEND_ROOT=<path to photo library root>
+    PARTITION=<partition path relative to backend root>
 
-Example:
-    .venv/bin/python profile_indexing.py \
-        /Users/antoinehue/Code/charlie/test-perso 2020
+Usage:
+    .venv/bin/python profiling/profile_indexing.py
 
 Output: prints step-level summary to stdout, saves full cProfile to
-profile_indexing_<partition_slug>.txt in the current directory.
+profiling/results/profile_indexing_<partition_slug>.txt.
 """
 
 import asyncio
@@ -18,8 +18,10 @@ import pstats
 import sys
 import time
 from collections import defaultdict
-from pathlib import PurePath
+from datetime import datetime
+from pathlib import Path, PurePath
 
+from dotenv import dotenv_values
 from ouestcharlie_toolkit.backends.local import LocalBackend
 from ouestcharlie_toolkit.manifest import ManifestStore
 from ouestcharlie_toolkit.xmp import XmpStore
@@ -173,12 +175,19 @@ async def profile_steps(backend_root: str, partition: str) -> None:
 
 
 def main() -> None:
-    if len(sys.argv) < 3:
-        print(__doc__)
+    env_file = Path(__file__).parent / ".env"
+    env = dotenv_values(env_file)
+    backend_root = env.get("BACKEND_ROOT", "")
+    partition = env.get("PARTITION", "")
+    if not backend_root or not partition:
+        print(f"Set BACKEND_ROOT and PARTITION in {env_file}")
         sys.exit(1)
-    backend_root, partition = sys.argv[1], sys.argv[2]
+
+    results_dir = Path(__file__).parent / "results"
+    results_dir.mkdir(exist_ok=True)
     slug = partition.replace("/", "_").replace(" ", "-")
-    out_path = f"profile_indexing_{slug}.txt"
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_path = results_dir / f"profile_indexing_{slug}_{ts}.txt"
 
     header = (
         f"=== Step-level timing (force EXIF) ===\nBackend: {backend_root}  Partition: {partition}\n"
@@ -212,7 +221,7 @@ def main() -> None:
         pstats.Stats(pr, stream=s3).sort_stats("cumulative").print_stats()
         f.write(s3.getvalue())
 
-    print(f"\nFull profile saved to: {out_path}")
+    print(f"\nFull profile saved to: {out_path.relative_to(Path(__file__).parent.parent)}")
 
 
 if __name__ == "__main__":
