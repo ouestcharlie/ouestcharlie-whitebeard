@@ -372,12 +372,11 @@ async def test_index_library_writes_summary_json(tmpdir: Path) -> None:
     result = await index_library(backend)
 
     assert result.total_photos == 2
-    # Leaf manifests exist.
+    # All traversed directories get a manifest (including intermediate ones).
     assert (tmpdir / METADATA_DIR / "2024" / "2024-07" / "manifest.json").exists()
     assert (tmpdir / METADATA_DIR / "2024" / "2024-08" / "manifest.json").exists()
-    # No intermediate parent manifest at 2024/.
-    assert not (tmpdir / METADATA_DIR / "2024" / "manifest.json").exists()
-    # summary.json lists both leaf partitions.
+    assert (tmpdir / METADATA_DIR / "2024" / "manifest.json").exists()
+    # summary.json lists all indexed partitions (photo-bearing and intermediate).
     data = json.loads((tmpdir / ".ouestcharlie" / "summary.json").read_text())
     paths = {p["path"] for p in data["partitions"]}
     assert "2024/2024-07" in paths
@@ -385,18 +384,18 @@ async def test_index_library_writes_summary_json(tmpdir: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_index_library_no_parent_manifests(tmpdir: Path) -> None:
-    """Intermediate folders (e.g. year level) must NOT get a manifest.json."""
+async def test_index_library_all_dirs_get_manifest(tmpdir: Path) -> None:
+    """All traversed directories get a manifest, including intermediate ones."""
     (tmpdir / "2024" / "July" / "Vacation").mkdir(parents=True)
     shutil.copy(_SAMPLE_JPG, tmpdir / "2024" / "July" / "Vacation" / "001.jpg")
     backend = LocalBackend(root=str(tmpdir))
 
     await index_library(backend)
 
-    # Only the folder directly containing photos gets a manifest.json.
+    # Every directory in the tree gets a manifest.json.
     assert (tmpdir / METADATA_DIR / "2024" / "July" / "Vacation" / "manifest.json").exists()
-    assert not (tmpdir / METADATA_DIR / "2024" / "July" / "manifest.json").exists()
-    assert not (tmpdir / METADATA_DIR / "2024" / "manifest.json").exists()
+    assert (tmpdir / METADATA_DIR / "2024" / "July" / "manifest.json").exists()
+    assert (tmpdir / METADATA_DIR / "2024" / "manifest.json").exists()
     # summary.json exists at root.
     assert (tmpdir / METADATA_DIR / "summary.json").exists()
 

@@ -12,7 +12,6 @@ from pathlib import PurePath
 from ouestcharlie_toolkit.backend import Backend
 from ouestcharlie_toolkit.manifest import ManifestStore
 from ouestcharlie_toolkit.schema import (
-    METADATA_DIR,
     SCHEMA_VERSION,
     LeafManifest,
     ManifestSummary,
@@ -125,9 +124,8 @@ async def index_partition(
     xmp_store = XmpStore(backend)
     manifest_store = ManifestStore(backend)
 
-    # List all files under partition and filter to direct-child photo files.
-    all_files = await backend.list_files(partition)
-    photo_files = _filter_photo_files(all_files, partition)
+    # List only direct-child photo files in the partition.
+    photo_files = await backend.list_files(partition, PHOTO_EXTENSIONS)
 
     photo_entries: list[PhotoEntry] = []
 
@@ -224,14 +222,21 @@ async def index_library(
     """
     library_result = LibraryIndexResult()
 
-    # Discover all partitions (directories directly containing photos).
-    all_files = await backend.list_files(root)
-    leaf_partitions = _discover_leaf_partitions(all_files, root)
+    # Walk the directory tree from root via BFS, collecting all partitions.
+    # Hidden directories (names starting with ".") are skipped — they are
+    # system or metadata folders, not user partitions.
+    partitions: list[str] = []
+    queue: list[str] = [root]
+    while queue:
+        current = queue.pop()
+        partitions.append(current)
+        for subdir in await backend.list_dirs(current):
+            if not PurePath(subdir).name.startswith("."):
+                queue.append(subdir)
 
     # Index each partition; each call also updates summary.json.
-    sorted_partitions = sorted(leaf_partitions)
-    total_partitions = len(sorted_partitions)
-    for i, partition in enumerate(sorted_partitions):
+    total_partitions = len(partitions)
+    for i, partition in enumerate(partitions):
         partition_result = await index_partition(
             backend,
             partition,
@@ -252,52 +257,8 @@ async def index_library(
 
 
 # ---------------------------------------------------------------------------
-# Internal helpers — partition discovery
-# ---------------------------------------------------------------------------
-
-
-def _discover_leaf_partitions(files: list, root: str) -> set[str]:
-    """Return the set of unique partition paths that directly contain photos.
-
-    A partition is the immediate parent directory of a photo file.
-    Paths inside metadata directories (METADATA_DIR) are excluded.
-    """
-    _meta_segment = f"{METADATA_DIR}/"
-    leaf_partitions: set[str] = set()
-    for f in files:
-        if _meta_segment in f.path:
-            continue
-        if PurePath(f.path).suffix.lower() not in PHOTO_EXTENSIONS:
-            continue
-        slash_pos = f.path.rfind("/")
-
-        # Photo at top level; partition is the root itself.
-        parent = root if slash_pos == -1 else f.path[:slash_pos]
-        leaf_partitions.add(parent)
-    return leaf_partitions
-
-
-# ---------------------------------------------------------------------------
 # Internal helpers — single-file processing
 # ---------------------------------------------------------------------------
-
-
-def _filter_photo_files(
-    files: list,  # list[FileInfo] — avoid importing FileInfo for type annotation
-    partition: str,
-) -> list:
-    """Return only the photo FileInfo entries that are direct children of partition."""
-    prefix = partition.rstrip("/") + "/" if partition else ""
-    result = []
-    for f in files:
-        # Strip partition prefix to get the filename relative to the partition.
-        rel = f.path[len(prefix) :] if f.path.startswith(prefix) else f.path
-        # Direct child: no directory separator in the relative part.
-        if "/" in rel:
-            continue
-        if PurePath(rel).suffix.lower() in PHOTO_EXTENSIONS:
-            result.append(f)
-    return result
 
 
 async def _extract_one(

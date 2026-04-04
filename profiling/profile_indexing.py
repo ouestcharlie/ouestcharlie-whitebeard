@@ -25,8 +25,8 @@ from ouestcharlie_toolkit.manifest import ManifestStore
 from ouestcharlie_toolkit.xmp import XmpStore
 
 from whitebeard.indexer import (
+    PHOTO_EXTENSIONS,
     _extract_one,
-    _filter_photo_files,
     _upsert_leaf_manifest,
 )
 
@@ -52,9 +52,13 @@ class TimingBackend:
 
     # ── Forwarded methods ─────────────────────────────────────────────────────
 
-    async def list_files(self, prefix: str, suffix: str = ""):
+    async def list_dirs(self, prefix: str):
+        with self._t("list_dirs"):
+            return await self._inner.list_dirs(prefix)
+
+    async def list_files(self, prefix: str, suffixes=None):
         with self._t("list_files"):
-            return await self._inner.list_files(prefix, suffix)
+            return await self._inner.list_files(prefix, suffixes)
 
     async def read(self, path: str):
         with self._t("read"):
@@ -100,8 +104,7 @@ async def profile_steps(backend_root: str, partition: str) -> None:
 
     # ── Step 1: Discovery ────────────────────────────────────────────────────
     t0 = time.perf_counter()
-    all_files = await backend.list_files(partition, "")
-    photo_files = _filter_photo_files(all_files, partition)
+    photo_files = await backend.list_files(partition, PHOTO_EXTENSIONS)
     t_discovery = time.perf_counter() - t0
     n = len(photo_files)
     print(f"Discovery:  {t_discovery * 1000:6.1f} ms  ({n} photos)")
