@@ -50,14 +50,14 @@ def tmpdir(tmp_path: Path) -> Path:
 def backend_with_sample(tmpdir: Path) -> LocalBackend:
     """Backend rooted at a temp dir that contains 001.jpg."""
     shutil.copy(_SAMPLE_JPG, tmpdir / "001.jpg")
-    return LocalBackend(root=str(tmpdir))
+    return LocalBackend(root=tmpdir)
 
 
 @pytest.fixture()
 def backend_with_minimal(tmpdir: Path) -> LocalBackend:
     """Backend rooted at a temp dir that contains a minimal JPEG (no EXIF)."""
     (tmpdir / "photo.jpg").write_bytes(_MINIMAL_JPEG)
-    return LocalBackend(root=str(tmpdir))
+    return LocalBackend(root=tmpdir)
 
 
 # ---------------------------------------------------------------------------
@@ -153,7 +153,7 @@ async def test_index_manifest_summary_rating_range(tmpdir: Path) -> None:
     (tmpdir / "a.jpg").write_bytes(_MINIMAL_JPEG)
     (tmpdir / "b.jpg").write_bytes(_MINIMAL_JPEG)
     (tmpdir / "c.jpg").write_bytes(_MINIMAL_JPEG)
-    backend = LocalBackend(root=str(tmpdir))
+    backend = LocalBackend(root=tmpdir)
 
     ratings = [2, 5, 4]
     call_count = 0
@@ -182,7 +182,7 @@ async def test_index_manifest_summary_rating_range(tmpdir: Path) -> None:
 async def test_index_manifest_summary_no_rating_when_unrated(tmpdir: Path) -> None:
     """ratingMin/ratingMax are absent from the summary when no photo has a rating."""
     (tmpdir / "photo.jpg").write_bytes(_MINIMAL_JPEG)
-    backend = LocalBackend(root=str(tmpdir))
+    backend = LocalBackend(root=tmpdir)
 
     await index_partition(backend, "")
 
@@ -248,7 +248,7 @@ async def test_index_ignores_non_photo_files(tmpdir: Path) -> None:
     (tmpdir / "notes.txt").write_text("hello")
     (tmpdir / "README.md").write_text("# readme")
     (tmpdir / "photo.jpg").write_bytes(_MINIMAL_JPEG)
-    backend = LocalBackend(root=str(tmpdir))
+    backend = LocalBackend(root=tmpdir)
 
     result = await index_partition(backend, "")
 
@@ -262,7 +262,7 @@ async def test_index_ignores_subdirectory_photos(tmpdir: Path) -> None:
     subdir.mkdir()
     (subdir / "deep.jpg").write_bytes(_MINIMAL_JPEG)
     (tmpdir / "top.jpg").write_bytes(_MINIMAL_JPEG)
-    backend = LocalBackend(root=str(tmpdir))
+    backend = LocalBackend(root=tmpdir)
 
     result = await index_partition(backend, "")
 
@@ -294,7 +294,7 @@ async def test_index_sub_partition(tmpdir: Path) -> None:
     sub = tmpdir / "Vacations" / "Italy"
     sub.mkdir(parents=True)
     shutil.copy(_SAMPLE_JPG, sub / "001.jpg")
-    backend = LocalBackend(root=str(tmpdir))
+    backend = LocalBackend(root=tmpdir)
 
     result = await index_partition(backend, "Vacations/Italy")
 
@@ -315,7 +315,7 @@ async def test_index_sub_partition(tmpdir: Path) -> None:
 async def test_index_library_single_partition(tmpdir: Path) -> None:
     """index_library with photos only at root creates a leaf manifest, no parent."""
     (tmpdir / "photo.jpg").write_bytes(_MINIMAL_JPEG)
-    backend = LocalBackend(root=str(tmpdir))
+    backend = LocalBackend(root=tmpdir)
 
     result = await index_library(backend)
 
@@ -333,7 +333,7 @@ async def test_index_partition_writes_summary_json(tmpdir: Path) -> None:
     """index_partition creates summary.json at the backend root."""
     (tmpdir / "2024" / "2024-07").mkdir(parents=True)
     (tmpdir / "2024" / "2024-07" / "a.jpg").write_bytes(_MINIMAL_JPEG)
-    backend = LocalBackend(root=str(tmpdir))
+    backend = LocalBackend(root=tmpdir)
 
     await index_partition(backend, "2024/2024-07")
 
@@ -351,7 +351,7 @@ async def test_index_partition_updates_existing_summary(tmpdir: Path) -> None:
     (tmpdir / "A").mkdir()
     (tmpdir / "A" / "p1.jpg").write_bytes(_MINIMAL_JPEG)
     (tmpdir / "A" / "p2.jpg").write_bytes(_MINIMAL_JPEG)
-    backend = LocalBackend(root=str(tmpdir))
+    backend = LocalBackend(root=tmpdir)
 
     await index_partition(backend, "A")
     await index_partition(backend, "A")  # second run — should not duplicate
@@ -368,7 +368,7 @@ async def test_index_library_writes_summary_json(tmpdir: Path) -> None:
     (tmpdir / "2024" / "2024-08").mkdir(parents=True)
     (tmpdir / "2024" / "2024-07" / "a.jpg").write_bytes(_MINIMAL_JPEG)
     (tmpdir / "2024" / "2024-08" / "b.jpg").write_bytes(_MINIMAL_JPEG)
-    backend = LocalBackend(root=str(tmpdir))
+    backend = LocalBackend(root=tmpdir)
 
     result = await index_library(backend)
 
@@ -389,7 +389,7 @@ async def test_index_library_all_dirs_get_manifest(tmpdir: Path) -> None:
     """All traversed directories get a manifest, including intermediate ones."""
     (tmpdir / "2024" / "July" / "Vacation").mkdir(parents=True)
     shutil.copy(_SAMPLE_JPG, tmpdir / "2024" / "July" / "Vacation" / "001.jpg")
-    backend = LocalBackend(root=str(tmpdir))
+    backend = LocalBackend(root=tmpdir)
 
     await index_library(backend)
 
@@ -412,7 +412,7 @@ async def test_index_library_summary_rating_range(tmpdir: Path) -> None:
     (tmpdir / "A" / "p2.jpg").write_bytes(_MINIMAL_JPEG)
     (tmpdir / "B").mkdir()
     (tmpdir / "B" / "p3.jpg").write_bytes(_MINIMAL_JPEG)
-    backend = LocalBackend(root=str(tmpdir))
+    backend = LocalBackend(root=tmpdir)
 
     for photo, rating in [("A/p1.jpg", 2), ("A/p2.jpg", 4), ("B/p3.jpg", 5)]:
         sidecar = XmpSidecar(content_hash=f"sha256:{'0' * 63}{rating}", rating=rating)
@@ -438,7 +438,7 @@ async def test_index_library_summary_photo_count(tmpdir: Path) -> None:
     (tmpdir / "A" / "p1.jpg").write_bytes(_MINIMAL_JPEG)
     (tmpdir / "A" / "p2.jpg").write_bytes(_MINIMAL_JPEG)
     (tmpdir / "B" / "p3.jpg").write_bytes(_MINIMAL_JPEG)
-    backend = LocalBackend(root=str(tmpdir))
+    backend = LocalBackend(root=tmpdir)
 
     await index_library(backend)
 
@@ -455,7 +455,7 @@ async def test_index_library_result_totals(tmpdir: Path) -> None:
     (tmpdir / "B").mkdir()
     (tmpdir / "A" / "p1.jpg").write_bytes(_MINIMAL_JPEG)
     (tmpdir / "B" / "p2.jpg").write_bytes(_MINIMAL_JPEG)
-    backend = LocalBackend(root=str(tmpdir))
+    backend = LocalBackend(root=tmpdir)
 
     result = await index_library(backend)
 
@@ -469,7 +469,7 @@ async def test_index_library_idempotent(tmpdir: Path) -> None:
     """Running index_library twice with the same library is idempotent."""
     (tmpdir / "A").mkdir()
     (tmpdir / "A" / "p.jpg").write_bytes(_MINIMAL_JPEG)
-    backend = LocalBackend(root=str(tmpdir))
+    backend = LocalBackend(root=tmpdir)
 
     await index_library(backend)
     result2 = await index_library(backend)
@@ -488,7 +488,7 @@ async def test_index_library_idempotent(tmpdir: Path) -> None:
 async def test_index_partition_logs_error_on_photo_failure(tmpdir: Path, caplog) -> None:
     """When _process_one raises, an ERROR with exc_info is logged."""
     (tmpdir / "broken.jpg").write_bytes(_MINIMAL_JPEG)
-    backend = LocalBackend(root=str(tmpdir))
+    backend = LocalBackend(root=tmpdir)
 
     with (
         patch("whitebeard.indexer._extract_one", side_effect=RuntimeError("simulated failure")),
@@ -523,7 +523,7 @@ async def test_index_mixed_timezone_photos(tmpdir: Path) -> None:
 
     (tmpdir / "a.jpg").write_bytes(_MINIMAL_JPEG)
     (tmpdir / "b.jpg").write_bytes(_MINIMAL_JPEG)
-    backend = LocalBackend(root=str(tmpdir))
+    backend = LocalBackend(root=tmpdir)
 
     call_count = 0
 
@@ -564,7 +564,7 @@ async def test_index_library_total_duration_ms(tmpdir: Path) -> None:
     (tmpdir / "B").mkdir()
     (tmpdir / "A" / "p1.jpg").write_bytes(_MINIMAL_JPEG)
     (tmpdir / "B" / "p2.jpg").write_bytes(_MINIMAL_JPEG)
-    backend = LocalBackend(root=str(tmpdir))
+    backend = LocalBackend(root=tmpdir)
 
     result = await index_library(backend)
 
@@ -587,7 +587,7 @@ async def test_index_library_concurrency_capped(tmpdir: Path) -> None:
     for i in range(n):
         (tmpdir / f"P{i}").mkdir()
         (tmpdir / f"P{i}" / "photo.jpg").write_bytes(_MINIMAL_JPEG)
-    backend = LocalBackend(root=str(tmpdir))
+    backend = LocalBackend(root=tmpdir)
 
     active: list[int] = []
     peak: list[int] = []
@@ -614,7 +614,7 @@ async def test_index_library_progress_callback_called_for_each_partition(tmpdir:
     for name in ("A", "B", "C"):
         (tmpdir / name).mkdir()
         (tmpdir / name / "photo.jpg").write_bytes(_MINIMAL_JPEG)
-    backend = LocalBackend(root=str(tmpdir))
+    backend = LocalBackend(root=tmpdir)
 
     calls: list[tuple] = []
 
