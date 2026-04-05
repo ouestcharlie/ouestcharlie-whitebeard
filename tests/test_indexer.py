@@ -16,6 +16,7 @@ from ouestcharlie_toolkit.schema import METADATA_DIR
 from ouestcharlie_toolkit.xmp import parse_xmp
 
 from whitebeard.indexer import (
+    _MAX_CONCURRENT_PARTITIONS,
     IndexResult,
     LibraryIndexResult,
     index_library,
@@ -558,7 +559,7 @@ async def test_index_partition_duration_ms(backend_with_sample: LocalBackend) ->
 
 @pytest.mark.asyncio
 async def test_index_library_total_duration_ms(tmpdir: Path) -> None:
-    """LibraryIndexResult.total_duration_ms sums durations across partitions."""
+    """LibraryIndexResult.total_duration_ms is wall-clock time, not the sum of partition times."""
     (tmpdir / "A").mkdir()
     (tmpdir / "B").mkdir()
     (tmpdir / "A" / "p1.jpg").write_bytes(_MINIMAL_JPEG)
@@ -567,5 +568,64 @@ async def test_index_library_total_duration_ms(tmpdir: Path) -> None:
 
     result = await index_library(backend)
 
-    assert result.total_duration_ms == sum(p.duration_ms for p in result.partitions)
+    assert isinstance(result.total_duration_ms, int)
     assert result.total_duration_ms >= 0
+    # Wall-clock must be <= sum of partition times (parallelism can only help).
+    assert result.total_duration_ms <= sum(p.duration_ms for p in result.partitions) + 50
+
+
+# ---------------------------------------------------------------------------
+# Parallel indexing
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_index_library_concurrency_capped(tmpdir: Path) -> None:
+    """No more than _MAX_CONCURRENT_PARTITIONS partitions run at the same time."""
+
+    n = _MAX_CONCURRENT_PARTITIONS + 2  # more partitions than the cap
+    for i in range(n):
+        (tmpdir / f"P{i}").mkdir()
+        (tmpdir / f"P{i}" / "photo.jpg").write_bytes(_MINIMAL_JPEG)
+    backend = LocalBackend(root=str(tmpdir))
+
+    active: list[int] = []
+    peak: list[int] = []
+
+    original_index_partition = index_partition
+
+    async def tracked_index_partition(b, partition, *args, **kwargs):
+        active.append(1)
+        peak.append(len(active))
+        try:
+            return await original_index_partition(b, partition, *args, **kwargs)
+        finally:
+            active.pop()
+
+    with patch("whitebeard.indexer.index_partition", side_effect=tracked_index_partition):
+        await index_library(backend)
+
+    assert max(peak) <= _MAX_CONCURRENT_PARTITIONS
+
+
+@pytest.mark.asyncio
+async def test_index_library_progress_callback_called_for_each_partition(tmpdir: Path) -> None:
+    """on_progress is called exactly once per partition."""
+    for name in ("A", "B", "C"):
+        (tmpdir / name).mkdir()
+        (tmpdir / name / "photo.jpg").write_bytes(_MINIMAL_JPEG)
+    backend = LocalBackend(root=str(tmpdir))
+
+    calls: list[tuple] = []
+
+    async def on_progress(done, total, partition, duration_ms, photos):
+        calls.append((done, total, partition))
+
+    await index_library(backend, on_progress=on_progress)
+
+    # One call per partition (root "" + A + B + C = 4 partitions)
+    assert len(calls) == 4
+    # 'total' is always the same; 'done' counts up to total
+    totals = {total for _, total, _ in calls}
+    assert totals == {4}
+    assert sorted(done for done, _, _ in calls) == [1, 2, 3, 4]

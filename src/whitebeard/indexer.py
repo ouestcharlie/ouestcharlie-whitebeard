@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from collections.abc import Awaitable, Callable, Generator
@@ -21,6 +22,10 @@ from ouestcharlie_toolkit.schema import (
 from ouestcharlie_toolkit.xmp import XmpStore
 
 _log = logging.getLogger(__name__)
+
+# Maximum number of partitions indexed concurrently. Kept low because thumbnail
+# generation is already multi-threaded internally.
+_MAX_CONCURRENT_PARTITIONS = 4
 
 # Photo file extensions indexed by Whitebeard (case-insensitive).
 PHOTO_EXTENSIONS: frozenset[str] = frozenset(
@@ -61,6 +66,7 @@ class LibraryIndexResult:
     """Result of indexing an entire photo library (all partitions)."""
 
     partitions: list[IndexResult] = field(default_factory=list)
+    total_duration_ms: int = 0  # wall-clock time for the full library run
 
     @property
     def total_photos(self) -> int:
@@ -77,10 +83,6 @@ class LibraryIndexResult:
     @property
     def total_thumbnails_rebuilt(self) -> int:
         return sum(1 for r in self.partitions if r.thumbnails_rebuilt)
-
-    @property
-    def total_duration_ms(self) -> int:
-        return sum(r.duration_ms for r in self.partitions)
 
     @property
     def error_details(self) -> Generator[str]:
@@ -234,25 +236,36 @@ async def index_library(
             if not PurePath(subdir).name.startswith("."):
                 queue.append(subdir)
 
-    # Index each partition; each call also updates summary.json.
+    # Index partitions in parallel, capped at _MAX_CONCURRENT_PARTITIONS workers.
+    # Thumbnail generation is already multi-threaded internally, so a low cap
+    # avoids over-saturating I/O while still hiding per-partition latency.
     total_partitions = len(partitions)
-    for i, partition in enumerate(partitions):
-        partition_result = await index_partition(
-            backend,
-            partition,
-            force_extract_exif,
-            generate_thumbnails=generate_thumbnails,
-        )
-        library_result.partitions.append(partition_result)
+    semaphore = asyncio.Semaphore(_MAX_CONCURRENT_PARTITIONS)
+    completed = 0
+
+    async def _index_one(partition: str) -> IndexResult:
+        nonlocal completed
+        async with semaphore:
+            result = await index_partition(
+                backend,
+                partition,
+                force_extract_exif,
+                generate_thumbnails=generate_thumbnails,
+            )
+        completed += 1
         if on_progress is not None:
             await on_progress(
-                i + 1,
+                completed,
                 total_partitions,
                 partition,
-                partition_result.duration_ms,
-                partition_result.photos_processed,
+                result.duration_ms,
+                result.photos_processed,
             )
+        return result
 
+    _t0 = time.monotonic()
+    library_result.partitions = list(await asyncio.gather(*(_index_one(p) for p in partitions)))
+    library_result.total_duration_ms = round((time.monotonic() - _t0) * 1000)
     return library_result
 
 
