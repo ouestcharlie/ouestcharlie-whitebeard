@@ -31,7 +31,7 @@ jobs:
       - name: Install package and run tests
         if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_tests }}
         run: |
-          pip install --find-links dist/ whitebeard pytest pytest-asyncio
+          pip install --find-links dist/ ouestcharlie-whitebeard pytest pytest-asyncio
           python -m pytest tests/ -v
 
       - uses: actions/upload-artifact@v6
