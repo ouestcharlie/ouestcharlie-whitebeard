@@ -23,14 +23,7 @@ from whitebeard.indexer import (
     index_partition,
 )
 
-# Sample JPEG from the py-toolkit test suite.
-_SAMPLE_JPG = (
-    Path(__file__).parent.parent.parent
-    / "ouestcharlie-py-toolkit"
-    / "tests"
-    / "sample-images"
-    / "001.jpg"
-)
+_SAMPLE_JPG = Path(__file__).parent / "sample-images" / "001.jpg"
 
 # Minimal valid JPEG (SOI + JFIF APP0 + EOI) — no EXIF data.
 _MINIMAL_JPEG = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00\xff\xd9"
