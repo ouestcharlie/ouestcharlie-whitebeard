@@ -440,7 +440,7 @@ wheels = [
 
 [[package]]
 name = "ouestcharlie-py-toolkit"
-version = "0.2.0"
+version = "0.2.1"
 source = { editable = "../ouestcharlie-py-toolkit" }
 dependencies = [
     { name = "blake3" },
@@ -452,7 +452,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "blake3", specifier = ">=1.0.8" },
-    { name = "mcp", specifier = ">=1.0" },
+    { name = "mcp", specifier = ">=1.27" },
     { name = "pyexiv2", specifier = ">=2.8" },
     { name = "pyjwt", specifier = ">=2.12.0" },
 ]
