@@ -5,12 +5,12 @@ from __future__ import annotations
 import logging
 
 from mcp.server.fastmcp import Context
-
-_log = logging.getLogger(__name__)
-
+from ouestcharlie_toolkit import report_progress
 from ouestcharlie_toolkit.server import AgentBase
 
 from .indexer import index_library, index_partition
+
+_log = logging.getLogger(__name__)
 
 
 class WhitebeardAgent(AgentBase):
@@ -27,7 +27,7 @@ class WhitebeardAgent(AgentBase):
     def _register_tools(self) -> None:
         mcp = self.mcp
 
-        @mcp.tool()
+        @mcp.tool(name="index_partition")
         async def index_partition_tool(
             ctx: Context,
             partition: str,
@@ -66,11 +66,18 @@ class WhitebeardAgent(AgentBase):
             """
             try:
                 result = await index_partition(
-                    self.backend, partition, force_extract_exif,
+                    self.backend,
+                    partition,
+                    force_extract_exif,
                     generate_thumbnails=generate_thumbnails,
                 )
             except Exception as exc:
-                _log.error("index_partition_tool failed — partition=%r: %s", partition, exc, exc_info=True)
+                _log.error(
+                    "index_partition failed — partition=%r: %s",
+                    partition,
+                    exc,
+                    exc_info=True,
+                )
                 raise
             return {
                 "partition": result.partition,
@@ -83,7 +90,7 @@ class WhitebeardAgent(AgentBase):
                 "durationMs": result.duration_ms,
             }
 
-        @mcp.tool()
+        @mcp.tool(name="index_library")
         async def index_library_tool(
             ctx: Context,
             root: str = "",
@@ -115,21 +122,27 @@ class WhitebeardAgent(AgentBase):
                 ``errorDetails`` — list of per-photo error messages across all partitions.
                 ``totalDurationMs`` — sum of per-partition wall-clock times in milliseconds.
             """
-            async def _library_progress(current: int, total: int, name: str, duration_ms: int = 0, photos: int = 0) -> None:
+
+            async def _library_progress(
+                current: int,
+                total: int,
+                name: str,
+                duration_ms: int = 0,
+                photos: int = 0,
+            ) -> None:
                 message = f"{name} — {photos} photos ({duration_ms}ms)" if duration_ms else name
-                try:
-                    await ctx.report_progress(progress=current, total=total, message=message)
-                except Exception as exc:
-                    _log.debug("Progress notification failed (client may have disconnected): %s", exc)
+                await report_progress(ctx, current, total, message)
 
             try:
                 result = await index_library(
-                    self.backend, root=root, force_extract_exif=force_extract_exif,
+                    self.backend,
+                    root=root,
+                    force_extract_exif=force_extract_exif,
                     generate_thumbnails=generate_thumbnails,
                     on_progress=_library_progress,
                 )
             except Exception as exc:
-                _log.error("index_library_tool failed — root=%r: %s", root, exc, exc_info=True)
+                _log.error("index_library failed — root=%r: %s", root, exc, exc_info=True)
                 raise
             return {
                 "partitionsIndexed": len(result.partitions),

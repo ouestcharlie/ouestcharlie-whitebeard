@@ -1,15 +1,16 @@
 """Standalone profiling script for index_partition.
 
-Usage:
-    .venv/bin/python profile_indexing.py <backend_root> <partition>
+Configuration is read from profiling/.env:
+    BACKEND_ROOT=<path to photo library root>
+    PARTITION=<partition path relative to backend root>
 
-Example:
-    .venv/bin/python profile_indexing.py \
-        /Users/antoinehue/Code/charlie/test-perso 2020
+Usage:
+    .venv/bin/python profiling/profile_indexing.py
 
 Output: prints step-level summary to stdout, saves full cProfile to
-profile_indexing_<partition_slug>.txt in the current directory.
+profiling/results/profile_indexing_<partition_slug>.txt.
 """
+
 import asyncio
 import cProfile
 import io
@@ -17,14 +18,17 @@ import pstats
 import sys
 import time
 from collections import defaultdict
-from pathlib import PurePath
+from datetime import datetime
+from pathlib import Path, PurePath
 
+from dotenv import dotenv_values
 from ouestcharlie_toolkit.backends.local import LocalBackend
 from ouestcharlie_toolkit.manifest import ManifestStore
 from ouestcharlie_toolkit.xmp import XmpStore
+
 from whitebeard.indexer import (
+    PHOTO_EXTENSIONS,
     _extract_one,
-    _filter_photo_files,
     _upsert_leaf_manifest,
 )
 
@@ -41,16 +45,22 @@ class TimingBackend:
         class _ctx:
             def __enter__(ctx):
                 ctx._t0 = time.perf_counter()
+
             def __exit__(ctx, *_):
                 self.totals[name] += time.perf_counter() - ctx._t0
                 self.counts[name] += 1
+
         return _ctx()
 
     # ── Forwarded methods ─────────────────────────────────────────────────────
 
-    async def list_files(self, prefix: str, suffix: str = ""):
+    async def list_dirs(self, prefix: str):
+        with self._t("list_dirs"):
+            return await self._inner.list_dirs(prefix)
+
+    async def list_files(self, prefix: str, suffixes=None):
         with self._t("list_files"):
-            return await self._inner.list_files(prefix, suffix)
+            return await self._inner.list_files(prefix, suffixes)
 
     async def read(self, path: str):
         with self._t("read"):
@@ -82,7 +92,7 @@ class TimingBackend:
             ms = self.totals[op] * 1000
             n = self.counts[op]
             if n:
-                lines.append(f"    {op:<20} {ms:7.1f} ms  ({n}×  avg {ms/n:.1f} ms)")
+                lines.append(f"    {op:<20} {ms:7.1f} ms  ({n}×  avg {ms / n:.1f} ms)")
         total_ms = sum(self.totals.values()) * 1000
         lines.append(f"    {'TOTAL':<20} {total_ms:7.1f} ms")
         return "\n".join(lines)
@@ -96,14 +106,14 @@ async def profile_steps(backend_root: str, partition: str) -> None:
 
     # ── Step 1: Discovery ────────────────────────────────────────────────────
     t0 = time.perf_counter()
-    all_files = await backend.list_files(partition, "")
-    photo_files = _filter_photo_files(all_files, partition)
+    photo_files = await backend.list_files(partition, PHOTO_EXTENSIONS)
     t_discovery = time.perf_counter() - t0
     n = len(photo_files)
-    print(f"Discovery:  {t_discovery*1000:6.1f} ms  ({n} photos)")
+    print(f"Discovery:  {t_discovery * 1000:6.1f} ms  ({n} photos)")
 
     # ── Step 2: EXIF extraction + XMP write (force) ──────────────────────────
-    backend.totals.clear(); backend.counts.clear()
+    backend.totals.clear()
+    backend.counts.clear()
     photo_entries = []
     t_exif_total = 0.0
     per_photo = []
@@ -118,9 +128,9 @@ async def profile_steps(backend_root: str, partition: str) -> None:
         t_exif_total += elapsed
         per_photo.append((PurePath(fi.path).name, elapsed * 1000))
 
-    print(f"EXIF+XMP:   {t_exif_total*1000:6.1f} ms  total")
+    print(f"EXIF+XMP:   {t_exif_total * 1000:6.1f} ms  total")
     if n:
-        print(f"            {t_exif_total*1000/n:6.1f} ms  avg/photo")
+        print(f"            {t_exif_total * 1000 / n:6.1f} ms  avg/photo")
     per_photo.sort(key=lambda x: -x[1])
     print("  Slowest 5 photos:")
     for name, ms in per_photo[:5]:
@@ -129,51 +139,63 @@ async def profile_steps(backend_root: str, partition: str) -> None:
 
     # ── Step 3: Thumbnail generation ─────────────────────────────────────────
     from ouestcharlie_toolkit.thumbnail_builder import generate_partition_thumbnails
-    backend.totals.clear(); backend.counts.clear()
+
+    backend.totals.clear()
+    backend.counts.clear()
     t0 = time.perf_counter()
     thumbnail_result = await generate_partition_thumbnails(
         backend, partition, photo_entries, tier="thumbnail"
     )
     t_thumbnails = time.perf_counter() - t0
-    print(f"Thumbnails: {t_thumbnails*1000:6.1f} ms")
+    print(f"Thumbnails: {t_thumbnails * 1000:6.1f} ms")
     print(backend.report())
 
     # ── Step 4: Manifest write ────────────────────────────────────────────────
-    backend.totals.clear(); backend.counts.clear()
+    backend.totals.clear()
+    backend.counts.clear()
     t0 = time.perf_counter()
-    summary = await _upsert_leaf_manifest(manifest_store, partition, photo_entries, thumbnail_result)
+    summary = await _upsert_leaf_manifest(
+        manifest_store, partition, photo_entries, thumbnail_result
+    )
     t_manifest = time.perf_counter() - t0
-    print(f"Manifest:   {t_manifest*1000:6.1f} ms")
+    print(f"Manifest:   {t_manifest * 1000:6.1f} ms")
     print(backend.report())
 
     # ── Step 5: Summary.json update ──────────────────────────────────────────
-    backend.totals.clear(); backend.counts.clear()
+    backend.totals.clear()
+    backend.counts.clear()
     t0 = time.perf_counter()
     await manifest_store.upsert_partition_in_summary(summary)
     t_summary = time.perf_counter() - t0
-    print(f"Summary:    {t_summary*1000:6.1f} ms")
+    print(f"Summary:    {t_summary * 1000:6.1f} ms")
     print(backend.report())
 
     total = t_discovery + t_exif_total + t_thumbnails + t_manifest + t_summary
-    print(f"\nTotal:      {total*1000:6.1f} ms")
+    print(f"\nTotal:      {total * 1000:6.1f} ms")
 
 
 def main() -> None:
-    if len(sys.argv) < 3:
-        print(__doc__)
+    env_file = Path(__file__).parent / ".env"
+    env = dotenv_values(env_file)
+    backend_root = env.get("BACKEND_ROOT", "")
+    partition = env.get("PARTITION", "")
+    if not backend_root or not partition:
+        print(f"Set BACKEND_ROOT and PARTITION in {env_file}")
         sys.exit(1)
-    backend_root, partition = sys.argv[1], sys.argv[2]
+
+    results_dir = Path(__file__).parent / "results"
+    results_dir.mkdir(exist_ok=True)
     slug = partition.replace("/", "_").replace(" ", "-")
-    out_path = f"profile_indexing_{slug}.txt"
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_path = results_dir / f"profile_indexing_{slug}_{ts}.txt"
 
     header = (
-        f"=== Step-level timing (force EXIF) ===\n"
-        f"Backend: {backend_root}  Partition: {partition}\n"
+        f"=== Step-level timing (force EXIF) ===\nBackend: {backend_root}  Partition: {partition}\n"
     )
     print(f"\n{header}")
     asyncio.run(profile_steps(backend_root, partition))
 
-    print(f"\n\n=== cProfile (top 40 by own time) ===\n")
+    print("\n\n=== cProfile (top 40 by own time) ===\n")
     pr = cProfile.Profile()
     pr.enable()
     asyncio.run(profile_steps(backend_root, partition))
@@ -199,7 +221,7 @@ def main() -> None:
         pstats.Stats(pr, stream=s3).sort_stats("cumulative").print_stats()
         f.write(s3.getvalue())
 
-    print(f"\nFull profile saved to: {out_path}")
+    print(f"\nFull profile saved to: {out_path.relative_to(Path(__file__).parent.parent)}")
 
 
 if __name__ == "__main__":

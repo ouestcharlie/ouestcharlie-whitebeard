@@ -2,37 +2,49 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Generator
 from dataclasses import dataclass, field
-from pathlib import PurePath
 from itertools import chain
-from typing import Generator
-
-_log = logging.getLogger(__name__)
+from pathlib import PurePath
 
 from ouestcharlie_toolkit.backend import Backend
 from ouestcharlie_toolkit.manifest import ManifestStore
 from ouestcharlie_toolkit.schema import (
-    METADATA_DIR,
     SCHEMA_VERSION,
     LeafManifest,
     ManifestSummary,
     PhotoEntry,
     ThumbnailChunk,
 )
-
 from ouestcharlie_toolkit.xmp import XmpStore
 
+_log = logging.getLogger(__name__)
+
+# Maximum number of partitions indexed concurrently. Kept low because thumbnail
+# generation is already multi-threaded internally.
+_MAX_CONCURRENT_PARTITIONS = 4
 
 # Photo file extensions indexed by Whitebeard (case-insensitive).
-PHOTO_EXTENSIONS: frozenset[str] = frozenset({
-    ".jpg", ".jpeg",
-    ".heic", ".heif",
-    ".png",
-    ".dng", ".cr2", ".cr3", ".nef", ".arw", ".raf", ".orf", ".rw2",
-})
+PHOTO_EXTENSIONS: frozenset[str] = frozenset(
+    {
+        ".jpg",
+        ".jpeg",
+        ".heic",
+        ".heif",
+        ".png",
+        ".dng",
+        ".cr2",
+        ".cr3",
+        ".nef",
+        ".arw",
+        ".raf",
+        ".orf",
+        ".rw2",
+    }
+)
 
 
 @dataclass
@@ -45,7 +57,6 @@ class IndexResult:
     sidecars_skipped: int = 0
     errors: int = 0
     error_details: list[str] = field(default_factory=list)
-    summary: ManifestSummary | None = None
     thumbnails_rebuilt: bool = False
     duration_ms: int = 0
 
@@ -55,6 +66,7 @@ class LibraryIndexResult:
     """Result of indexing an entire photo library (all partitions)."""
 
     partitions: list[IndexResult] = field(default_factory=list)
+    total_duration_ms: int = 0  # wall-clock time for the full library run
 
     @property
     def total_photos(self) -> int:
@@ -71,10 +83,6 @@ class LibraryIndexResult:
     @property
     def total_thumbnails_rebuilt(self) -> int:
         return sum(1 for r in self.partitions if r.thumbnails_rebuilt)
-
-    @property
-    def total_duration_ms(self) -> int:
-        return sum(r.duration_ms for r in self.partitions)
 
     @property
     def error_details(self) -> Generator[str]:
@@ -118,9 +126,8 @@ async def index_partition(
     xmp_store = XmpStore(backend)
     manifest_store = ManifestStore(backend)
 
-    # List all files under partition and filter to direct-child photo files.
-    all_files = await backend.list_files(partition)
-    photo_files = _filter_photo_files(all_files, partition)
+    # List only direct-child photo files in the partition.
+    photo_files = await backend.list_files(partition, PHOTO_EXTENSIONS)
 
     photo_entries: list[PhotoEntry] = []
 
@@ -137,7 +144,10 @@ async def index_partition(
         except Exception as exc:
             _log.error(
                 "Failed to process photo — partition=%r file=%r: %s",
-                partition, filename, exc, exc_info=True
+                partition,
+                filename,
+                exc,
+                exc_info=True,
             )
             result.errors += 1
             result.error_details.append(f"{filename}: {exc}")
@@ -146,7 +156,10 @@ async def index_partition(
     thumbnail_result = None
     if generate_thumbnails and photo_entries:
         try:
-            from ouestcharlie_toolkit.thumbnail_builder import generate_partition_thumbnails
+            from ouestcharlie_toolkit.thumbnail_builder import (
+                generate_partition_thumbnails,
+            )
+
             thumbnail_result = await generate_partition_thumbnails(
                 backend, partition, photo_entries, tier="thumbnail"
             )
@@ -154,24 +167,28 @@ async def index_partition(
         except Exception as exc:
             _log.error(
                 "Thumbnail generation failed — partition=%r: %s",
-                partition, exc, exc_info=True,
+                partition,
+                exc,
+                exc_info=True,
             )
             result.errors += 1
             result.error_details.append(f"thumbnails: {exc}")
 
     # Build or update the leaf manifest.
-    result.summary = await _upsert_leaf_manifest(
+    summary = await _upsert_leaf_manifest(
         manifest_store, partition, photo_entries, thumbnail_result
     )
 
     # Update the backend-wide summary.json with this partition's new summary.
-    if result.summary is not None:
+    if summary is not None:
         try:
-            await manifest_store.upsert_partition_in_summary(result.summary)
+            await manifest_store.upsert_partition_in_summary(summary)
         except Exception as exc:
             _log.error(
                 "Failed to update summary.json — partition=%r: %s",
-                partition, exc, exc_info=True,
+                partition,
+                exc,
+                exc_info=True,
             )
             result.errors += 1
             result.error_details.append(f"summary.json update: {exc}")
@@ -207,74 +224,54 @@ async def index_library(
     """
     library_result = LibraryIndexResult()
 
-    # Discover all partitions (directories directly containing photos).
-    all_files = await backend.list_files(root)
-    leaf_partitions = _discover_leaf_partitions(all_files, root)
+    # Walk the directory tree from root via BFS, collecting all partitions.
+    # Hidden directories (names starting with ".") are skipped — they are
+    # system or metadata folders, not user partitions.
+    partitions: list[str] = []
+    queue: list[str] = [root]
+    while queue:
+        current = queue.pop()
+        partitions.append(current)
+        for subdir in await backend.list_dirs(current):
+            if not PurePath(subdir).name.startswith("."):
+                queue.append(subdir)
 
-    # Index each partition; each call also updates summary.json.
-    sorted_partitions = sorted(leaf_partitions)
-    total_partitions = len(sorted_partitions)
-    for i, partition in enumerate(sorted_partitions):
-        partition_result = await index_partition(
-            backend, partition, force_extract_exif,
-            generate_thumbnails=generate_thumbnails,
-        )
-        library_result.partitions.append(partition_result)
+    # Index partitions in parallel, capped at _MAX_CONCURRENT_PARTITIONS workers.
+    # Thumbnail generation is already multi-threaded internally, so a low cap
+    # avoids over-saturating I/O while still hiding per-partition latency.
+    total_partitions = len(partitions)
+    semaphore = asyncio.Semaphore(_MAX_CONCURRENT_PARTITIONS)
+    completed = 0
+
+    async def _index_one(partition: str) -> IndexResult:
+        nonlocal completed
+        async with semaphore:
+            result = await index_partition(
+                backend,
+                partition,
+                force_extract_exif,
+                generate_thumbnails=generate_thumbnails,
+            )
+        completed += 1
         if on_progress is not None:
-            await on_progress(i + 1, total_partitions, partition, partition_result.duration_ms, partition_result.photos_processed)
+            await on_progress(
+                completed,
+                total_partitions,
+                partition,
+                result.duration_ms,
+                result.photos_processed,
+            )
+        return result
 
+    _t0 = time.monotonic()
+    library_result.partitions = list(await asyncio.gather(*(_index_one(p) for p in partitions)))
+    library_result.total_duration_ms = round((time.monotonic() - _t0) * 1000)
     return library_result
-
-
-# ---------------------------------------------------------------------------
-# Internal helpers — partition discovery
-# ---------------------------------------------------------------------------
-
-
-def _discover_leaf_partitions(files: list, root: str) -> set[str]:
-    """Return the set of unique partition paths that directly contain photos.
-
-    A partition is the immediate parent directory of a photo file.
-    Paths inside metadata directories (METADATA_DIR) are excluded.
-    """
-    _meta_segment = f"{METADATA_DIR}/"
-    leaf_partitions: set[str] = set()
-    for f in files:
-        if _meta_segment in f.path:
-            continue
-        if PurePath(f.path).suffix.lower() not in PHOTO_EXTENSIONS:
-            continue
-        slash_pos = f.path.rfind("/")
-        if slash_pos == -1:
-            # Photo at top level; partition is the root itself.
-            parent = root
-        else:
-            parent = f.path[:slash_pos]
-        leaf_partitions.add(parent)
-    return leaf_partitions
 
 
 # ---------------------------------------------------------------------------
 # Internal helpers — single-file processing
 # ---------------------------------------------------------------------------
-
-
-def _filter_photo_files(
-    files: list,  # list[FileInfo] — avoid importing FileInfo for type annotation
-    partition: str,
-) -> list:
-    """Return only the photo FileInfo entries that are direct children of partition."""
-    prefix = partition.rstrip("/") + "/" if partition else ""
-    result = []
-    for f in files:
-        # Strip partition prefix to get the filename relative to the partition.
-        rel = f.path[len(prefix):] if f.path.startswith(prefix) else f.path
-        # Direct child: no directory separator in the relative part.
-        if "/" in rel:
-            continue
-        if PurePath(rel).suffix.lower() in PHOTO_EXTENSIONS:
-            result.append(f)
-    return result
 
 
 async def _extract_one(
@@ -291,7 +288,9 @@ async def _extract_one(
         photo_path, force=force_extract_exif
     )
     filename = PurePath(photo_path).name
-    entry = PhotoEntry.from_sidecar(filename, sidecar, sidecar.content_hash or "", str(version.value))
+    entry = PhotoEntry.from_sidecar(
+        filename, sidecar, sidecar.content_hash or "", str(version.value)
+    )
     return entry, created
 
 
@@ -315,7 +314,6 @@ async def _upsert_leaf_manifest(
         schema_version=SCHEMA_VERSION,
         partition=partition,
         photos=photo_entries,
-        summary=summary,
     )
     try:
         existing, version = await manifest_store.read_leaf(partition)

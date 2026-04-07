@@ -5,40 +5,28 @@ from __future__ import annotations
 import json
 import logging
 import shutil
-import tempfile
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
-
 from ouestcharlie_toolkit.backends.local import LocalBackend
-from ouestcharlie_toolkit.schema import METADATA_DIR, manifest_path, summary_path
-from ouestcharlie_toolkit.xmp import parse_xmp, xmp_path_for
+from ouestcharlie_toolkit.manifest import ManifestStore, ManifestSummary
+from ouestcharlie_toolkit.schema import METADATA_DIR
+from ouestcharlie_toolkit.xmp import parse_xmp
 
 from whitebeard.indexer import (
-    PHOTO_EXTENSIONS,
+    _MAX_CONCURRENT_PARTITIONS,
     IndexResult,
     LibraryIndexResult,
     index_library,
     index_partition,
 )
 
-# Sample JPEG from the py-toolkit test suite.
-_SAMPLE_JPG = (
-    Path(__file__).parent.parent.parent
-    / "ouestcharlie-py-toolkit"
-    / "tests"
-    / "sample-images"
-    / "001.jpg"
-)
+_SAMPLE_JPG = Path(__file__).parent / "sample-images" / "001.jpg"
 
 # Minimal valid JPEG (SOI + JFIF APP0 + EOI) — no EXIF data.
-_MINIMAL_JPEG = (
-    b"\xff\xd8"
-    b"\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00"
-    b"\xff\xd9"
-)
+_MINIMAL_JPEG = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00\xff\xd9"
 
 
 # ---------------------------------------------------------------------------
@@ -55,14 +43,14 @@ def tmpdir(tmp_path: Path) -> Path:
 def backend_with_sample(tmpdir: Path) -> LocalBackend:
     """Backend rooted at a temp dir that contains 001.jpg."""
     shutil.copy(_SAMPLE_JPG, tmpdir / "001.jpg")
-    return LocalBackend(root=str(tmpdir))
+    return LocalBackend(root=tmpdir)
 
 
 @pytest.fixture()
 def backend_with_minimal(tmpdir: Path) -> LocalBackend:
     """Backend rooted at a temp dir that contains a minimal JPEG (no EXIF)."""
     (tmpdir / "photo.jpg").write_bytes(_MINIMAL_JPEG)
-    return LocalBackend(root=str(tmpdir))
+    return LocalBackend(root=tmpdir)
 
 
 # ---------------------------------------------------------------------------
@@ -78,7 +66,9 @@ async def test_index_creates_xmp_sidecar(backend_with_sample: LocalBackend, tmpd
 
 
 @pytest.mark.asyncio
-async def test_index_sidecar_has_content_hash(backend_with_sample: LocalBackend, tmpdir: Path) -> None:
+async def test_index_sidecar_has_content_hash(
+    backend_with_sample: LocalBackend, tmpdir: Path
+) -> None:
     """The created XMP sidecar contains an ouestcharlie:contentHash."""
     await index_partition(backend_with_sample, "")
     sidecar = parse_xmp((tmpdir / "001.xmp").read_text(encoding="utf-8"))
@@ -87,7 +77,9 @@ async def test_index_sidecar_has_content_hash(backend_with_sample: LocalBackend,
 
 
 @pytest.mark.asyncio
-async def test_index_sidecar_has_camera_fields(backend_with_sample: LocalBackend, tmpdir: Path) -> None:
+async def test_index_sidecar_has_camera_fields(
+    backend_with_sample: LocalBackend, tmpdir: Path
+) -> None:
     """The created XMP sidecar contains make/model extracted from EXIF."""
     await index_partition(backend_with_sample, "")
     sidecar = parse_xmp((tmpdir / "001.xmp").read_text(encoding="utf-8"))
@@ -124,30 +116,37 @@ async def test_index_manifest_photo_entry(backend_with_sample: LocalBackend, tmp
 async def test_index_manifest_summary(backend_with_sample: LocalBackend, tmpdir: Path) -> None:
     """The leaf manifest summary reflects the photo count."""
     await index_partition(backend_with_sample, "")
-    data = json.loads((tmpdir / METADATA_DIR / "manifest.json").read_text())
-    assert data["summary"]["photoCount"] == 1
+
+    manifestStore = ManifestStore(backend_with_sample)
+    manifest, _ = await manifestStore.read_leaf("")
+    summary = ManifestSummary.from_photos("", manifest.photos)
+    assert summary.photo_count == 1
 
 
 @pytest.mark.asyncio
 async def test_index_manifest_has_date(backend_with_sample: LocalBackend, tmpdir: Path) -> None:
     """The manifest summary has a date range when the photo has EXIF date."""
     await index_partition(backend_with_sample, "")
-    data = json.loads((tmpdir / METADATA_DIR / "manifest.json").read_text())
+
+    manifestStore = ManifestStore(backend_with_sample)
+    manifest, _ = await manifestStore.read_leaf("")
+    summary = ManifestSummary.from_photos("", manifest.photos)
+
     # 001.jpg has EXIF DateTimeOriginal
-    assert "dateTaken" in data["summary"]
-    assert "min" in data["summary"]["dateTaken"]
-    assert "max" in data["summary"]["dateTaken"]
+    assert "dateTaken" in summary._stats
+    assert "min" in summary._stats["dateTaken"]
+    assert "max" in summary._stats["dateTaken"]
 
 
 @pytest.mark.asyncio
 async def test_index_manifest_summary_rating_range(tmpdir: Path) -> None:
     """Leaf manifest summary has ratingMin/ratingMax when photos have ratings."""
-    from ouestcharlie_toolkit.schema import PhotoEntry, XmpSidecar, VersionToken
+    from ouestcharlie_toolkit.schema import PhotoEntry, XmpSidecar
 
     (tmpdir / "a.jpg").write_bytes(_MINIMAL_JPEG)
     (tmpdir / "b.jpg").write_bytes(_MINIMAL_JPEG)
     (tmpdir / "c.jpg").write_bytes(_MINIMAL_JPEG)
-    backend = LocalBackend(root=str(tmpdir))
+    backend = LocalBackend(root=tmpdir)
 
     ratings = [2, 5, 4]
     call_count = 0
@@ -157,32 +156,34 @@ async def test_index_manifest_summary_rating_range(tmpdir: Path) -> None:
         r = ratings[call_count]
         call_count += 1
         sidecar = XmpSidecar(content_hash=f"sha256:{'0' * 63}{call_count}", rating=r)
-        entry = PhotoEntry.from_sidecar(photo_path.split("/")[-1], sidecar, sidecar.content_hash, "1")
+        entry = PhotoEntry.from_sidecar(
+            photo_path.split("/")[-1], sidecar, sidecar.content_hash, "1"
+        )
         return entry, True
 
     with patch("whitebeard.indexer._extract_one", side_effect=fake_process):
-        result = await index_partition(backend, "")
+        await index_partition(backend, "")
 
-    assert result.summary is not None
-    assert result.summary.rating["min"] == 2
-    assert result.summary.rating["max"] == 5
-
-    data = json.loads((tmpdir / METADATA_DIR / "manifest.json").read_text())
-    assert data["summary"]["rating"]["min"] == 2
-    assert data["summary"]["rating"]["max"] == 5
+    manifestStore = ManifestStore(backend)
+    manifest, _ = await manifestStore.read_leaf("")
+    summary = ManifestSummary.from_photos("", manifest.photos)
+    assert summary._stats["rating"]["min"] == 2
+    assert summary._stats["rating"]["max"] == 5
 
 
 @pytest.mark.asyncio
 async def test_index_manifest_summary_no_rating_when_unrated(tmpdir: Path) -> None:
     """ratingMin/ratingMax are absent from the summary when no photo has a rating."""
     (tmpdir / "photo.jpg").write_bytes(_MINIMAL_JPEG)
-    backend = LocalBackend(root=str(tmpdir))
+    backend = LocalBackend(root=tmpdir)
 
     await index_partition(backend, "")
 
-    data = json.loads((tmpdir / METADATA_DIR / "manifest.json").read_text())
-    assert "ratingMin" not in data["summary"]
-    assert "ratingMax" not in data["summary"]
+    manifestStore = ManifestStore(backend)
+    manifest, _ = await manifestStore.read_leaf("")
+    summary = ManifestSummary.from_photos("", manifest.photos)
+
+    assert "rating" not in summary._stats
 
 
 # ---------------------------------------------------------------------------
@@ -191,7 +192,9 @@ async def test_index_manifest_summary_no_rating_when_unrated(tmpdir: Path) -> No
 
 
 @pytest.mark.asyncio
-async def test_index_skips_existing_sidecar(backend_with_sample: LocalBackend, tmpdir: Path) -> None:
+async def test_index_skips_existing_sidecar(
+    backend_with_sample: LocalBackend, tmpdir: Path
+) -> None:
     """Without force, an existing XMP sidecar is not overwritten."""
     sentinel = "<!-- sentinel -->"
     xmp_path = tmpdir / "001.xmp"
@@ -205,14 +208,16 @@ async def test_index_skips_existing_sidecar(backend_with_sample: LocalBackend, t
 
 
 @pytest.mark.asyncio
-async def test_index_force_overwrites_sidecar(backend_with_sample: LocalBackend, tmpdir: Path) -> None:
+async def test_index_force_overwrites_sidecar(
+    backend_with_sample: LocalBackend, tmpdir: Path
+) -> None:
     """With force=True, an existing XMP sidecar is replaced with fresh EXIF data."""
     # First index run creates the sidecar.
     await index_partition(backend_with_sample, "")
 
     # Overwrite the sidecar with a sentinel.
     xmp_path = tmpdir / "001.xmp"
-    original_content = xmp_path.read_text(encoding="utf-8")
+    # original_content = xmp_path.read_text(encoding="utf-8")
     xmp_path.write_text("<!-- overwritten -->", encoding="utf-8")
 
     result = await index_partition(backend_with_sample, "", force_extract_exif=True)
@@ -236,7 +241,7 @@ async def test_index_ignores_non_photo_files(tmpdir: Path) -> None:
     (tmpdir / "notes.txt").write_text("hello")
     (tmpdir / "README.md").write_text("# readme")
     (tmpdir / "photo.jpg").write_bytes(_MINIMAL_JPEG)
-    backend = LocalBackend(root=str(tmpdir))
+    backend = LocalBackend(root=tmpdir)
 
     result = await index_partition(backend, "")
 
@@ -250,7 +255,7 @@ async def test_index_ignores_subdirectory_photos(tmpdir: Path) -> None:
     subdir.mkdir()
     (subdir / "deep.jpg").write_bytes(_MINIMAL_JPEG)
     (tmpdir / "top.jpg").write_bytes(_MINIMAL_JPEG)
-    backend = LocalBackend(root=str(tmpdir))
+    backend = LocalBackend(root=tmpdir)
 
     result = await index_partition(backend, "")
 
@@ -282,13 +287,13 @@ async def test_index_sub_partition(tmpdir: Path) -> None:
     sub = tmpdir / "Vacations" / "Italy"
     sub.mkdir(parents=True)
     shutil.copy(_SAMPLE_JPG, sub / "001.jpg")
-    backend = LocalBackend(root=str(tmpdir))
+    backend = LocalBackend(root=tmpdir)
 
     result = await index_partition(backend, "Vacations/Italy")
 
     assert result.photos_processed == 1
     assert result.sidecars_created == 1
-    manifest_file = tmpdir / "Vacations" / "Italy" / METADATA_DIR / "manifest.json"
+    manifest_file = tmpdir / METADATA_DIR / "Vacations" / "Italy" / "manifest.json"
     assert manifest_file.exists()
     data = json.loads(manifest_file.read_text())
     assert data["partition"] == "Vacations/Italy"
@@ -303,7 +308,7 @@ async def test_index_sub_partition(tmpdir: Path) -> None:
 async def test_index_library_single_partition(tmpdir: Path) -> None:
     """index_library with photos only at root creates a leaf manifest, no parent."""
     (tmpdir / "photo.jpg").write_bytes(_MINIMAL_JPEG)
-    backend = LocalBackend(root=str(tmpdir))
+    backend = LocalBackend(root=tmpdir)
 
     result = await index_library(backend)
 
@@ -321,7 +326,7 @@ async def test_index_partition_writes_summary_json(tmpdir: Path) -> None:
     """index_partition creates summary.json at the backend root."""
     (tmpdir / "2024" / "2024-07").mkdir(parents=True)
     (tmpdir / "2024" / "2024-07" / "a.jpg").write_bytes(_MINIMAL_JPEG)
-    backend = LocalBackend(root=str(tmpdir))
+    backend = LocalBackend(root=tmpdir)
 
     await index_partition(backend, "2024/2024-07")
 
@@ -339,7 +344,7 @@ async def test_index_partition_updates_existing_summary(tmpdir: Path) -> None:
     (tmpdir / "A").mkdir()
     (tmpdir / "A" / "p1.jpg").write_bytes(_MINIMAL_JPEG)
     (tmpdir / "A" / "p2.jpg").write_bytes(_MINIMAL_JPEG)
-    backend = LocalBackend(root=str(tmpdir))
+    backend = LocalBackend(root=tmpdir)
 
     await index_partition(backend, "A")
     await index_partition(backend, "A")  # second run — should not duplicate
@@ -356,17 +361,16 @@ async def test_index_library_writes_summary_json(tmpdir: Path) -> None:
     (tmpdir / "2024" / "2024-08").mkdir(parents=True)
     (tmpdir / "2024" / "2024-07" / "a.jpg").write_bytes(_MINIMAL_JPEG)
     (tmpdir / "2024" / "2024-08" / "b.jpg").write_bytes(_MINIMAL_JPEG)
-    backend = LocalBackend(root=str(tmpdir))
+    backend = LocalBackend(root=tmpdir)
 
     result = await index_library(backend)
 
     assert result.total_photos == 2
-    # Leaf manifests exist.
-    assert (tmpdir / "2024" / "2024-07" / METADATA_DIR / "manifest.json").exists()
-    assert (tmpdir / "2024" / "2024-08" / METADATA_DIR / "manifest.json").exists()
-    # No intermediate parent manifest at 2024/.
-    assert not (tmpdir / "2024" / METADATA_DIR / "manifest.json").exists()
-    # summary.json lists both leaf partitions.
+    # All traversed directories get a manifest (including intermediate ones).
+    assert (tmpdir / METADATA_DIR / "2024" / "2024-07" / "manifest.json").exists()
+    assert (tmpdir / METADATA_DIR / "2024" / "2024-08" / "manifest.json").exists()
+    assert (tmpdir / METADATA_DIR / "2024" / "manifest.json").exists()
+    # summary.json lists all indexed partitions (photo-bearing and intermediate).
     data = json.loads((tmpdir / ".ouestcharlie" / "summary.json").read_text())
     paths = {p["path"] for p in data["partitions"]}
     assert "2024/2024-07" in paths
@@ -374,18 +378,18 @@ async def test_index_library_writes_summary_json(tmpdir: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_index_library_no_parent_manifests(tmpdir: Path) -> None:
-    """Intermediate folders (e.g. year level) must NOT get a manifest.json."""
+async def test_index_library_all_dirs_get_manifest(tmpdir: Path) -> None:
+    """All traversed directories get a manifest, including intermediate ones."""
     (tmpdir / "2024" / "July" / "Vacation").mkdir(parents=True)
     shutil.copy(_SAMPLE_JPG, tmpdir / "2024" / "July" / "Vacation" / "001.jpg")
-    backend = LocalBackend(root=str(tmpdir))
+    backend = LocalBackend(root=tmpdir)
 
     await index_library(backend)
 
-    # Only the folder directly containing photos gets a manifest.json.
-    assert (tmpdir / "2024" / "July" / "Vacation" / METADATA_DIR / "manifest.json").exists()
-    assert not (tmpdir / "2024" / "July" / METADATA_DIR / "manifest.json").exists()
-    assert not (tmpdir / "2024" / METADATA_DIR / "manifest.json").exists()
+    # Every directory in the tree gets a manifest.json.
+    assert (tmpdir / METADATA_DIR / "2024" / "July" / "Vacation" / "manifest.json").exists()
+    assert (tmpdir / METADATA_DIR / "2024" / "July" / "manifest.json").exists()
+    assert (tmpdir / METADATA_DIR / "2024" / "manifest.json").exists()
     # summary.json exists at root.
     assert (tmpdir / METADATA_DIR / "summary.json").exists()
 
@@ -401,7 +405,7 @@ async def test_index_library_summary_rating_range(tmpdir: Path) -> None:
     (tmpdir / "A" / "p2.jpg").write_bytes(_MINIMAL_JPEG)
     (tmpdir / "B").mkdir()
     (tmpdir / "B" / "p3.jpg").write_bytes(_MINIMAL_JPEG)
-    backend = LocalBackend(root=str(tmpdir))
+    backend = LocalBackend(root=tmpdir)
 
     for photo, rating in [("A/p1.jpg", 2), ("A/p2.jpg", 4), ("B/p3.jpg", 5)]:
         sidecar = XmpSidecar(content_hash=f"sha256:{'0' * 63}{rating}", rating=rating)
@@ -427,7 +431,7 @@ async def test_index_library_summary_photo_count(tmpdir: Path) -> None:
     (tmpdir / "A" / "p1.jpg").write_bytes(_MINIMAL_JPEG)
     (tmpdir / "A" / "p2.jpg").write_bytes(_MINIMAL_JPEG)
     (tmpdir / "B" / "p3.jpg").write_bytes(_MINIMAL_JPEG)
-    backend = LocalBackend(root=str(tmpdir))
+    backend = LocalBackend(root=tmpdir)
 
     await index_library(backend)
 
@@ -444,7 +448,7 @@ async def test_index_library_result_totals(tmpdir: Path) -> None:
     (tmpdir / "B").mkdir()
     (tmpdir / "A" / "p1.jpg").write_bytes(_MINIMAL_JPEG)
     (tmpdir / "B" / "p2.jpg").write_bytes(_MINIMAL_JPEG)
-    backend = LocalBackend(root=str(tmpdir))
+    backend = LocalBackend(root=tmpdir)
 
     result = await index_library(backend)
 
@@ -458,7 +462,7 @@ async def test_index_library_idempotent(tmpdir: Path) -> None:
     """Running index_library twice with the same library is idempotent."""
     (tmpdir / "A").mkdir()
     (tmpdir / "A" / "p.jpg").write_bytes(_MINIMAL_JPEG)
-    backend = LocalBackend(root=str(tmpdir))
+    backend = LocalBackend(root=tmpdir)
 
     await index_library(backend)
     result2 = await index_library(backend)
@@ -477,14 +481,13 @@ async def test_index_library_idempotent(tmpdir: Path) -> None:
 async def test_index_partition_logs_error_on_photo_failure(tmpdir: Path, caplog) -> None:
     """When _process_one raises, an ERROR with exc_info is logged."""
     (tmpdir / "broken.jpg").write_bytes(_MINIMAL_JPEG)
-    backend = LocalBackend(root=str(tmpdir))
+    backend = LocalBackend(root=tmpdir)
 
-    with patch(
-        "whitebeard.indexer._extract_one",
-        side_effect=RuntimeError("simulated failure"),
+    with (
+        patch("whitebeard.indexer._extract_one", side_effect=RuntimeError("simulated failure")),
+        caplog.at_level(logging.ERROR, logger="whitebeard.indexer"),
     ):
-        with caplog.at_level(logging.ERROR, logger="whitebeard.indexer"):
-            result = await index_partition(backend, "")
+        result = await index_partition(backend, "")
 
     assert result.errors == 1
     assert any("simulated failure" in msg for msg in caplog.messages)
@@ -504,15 +507,16 @@ async def test_index_mixed_timezone_photos(tmpdir: Path) -> None:
     Regression test: min()/max() over a mixed list raises TypeError without the
     _naive() key function.
     """
-    from datetime import timezone, timedelta
-    from ouestcharlie_toolkit.schema import PhotoEntry, XmpSidecar, VersionToken
+    from datetime import timedelta, timezone
+
+    from ouestcharlie_toolkit.schema import PhotoEntry, VersionToken, XmpSidecar
 
     naive_dt = datetime(2024, 7, 1, 12, 0, 0)
     aware_dt = datetime(2024, 7, 2, 12, 0, 0, tzinfo=timezone(timedelta(hours=2)))
 
     (tmpdir / "a.jpg").write_bytes(_MINIMAL_JPEG)
     (tmpdir / "b.jpg").write_bytes(_MINIMAL_JPEG)
-    backend = LocalBackend(root=str(tmpdir))
+    backend = LocalBackend(root=tmpdir)
 
     call_count = 0
 
@@ -522,17 +526,15 @@ async def test_index_mixed_timezone_photos(tmpdir: Path) -> None:
         dt = naive_dt if call_count == 1 else aware_dt
         sidecar = XmpSidecar(content_hash=f"sha256:{'0' * 64}", date_taken=dt)
         token = VersionToken(value=1)
-        entry = PhotoEntry.from_sidecar(photo_path.split("/")[-1], sidecar, sidecar.content_hash, str(token.value))
+        entry = PhotoEntry.from_sidecar(
+            photo_path.split("/")[-1], sidecar, sidecar.content_hash, str(token.value)
+        )
         return entry, True
 
     with patch("whitebeard.indexer._extract_one", side_effect=fake_process):
         result = await index_partition(backend, "")
 
     assert result.errors == 0
-    assert result.summary is not None
-    assert result.summary.dateTaken is not None
-    assert result.summary.dateTaken["min"] is not None
-    assert result.summary.dateTaken["max"] is not None
 
 
 # ---------------------------------------------------------------------------
@@ -550,14 +552,73 @@ async def test_index_partition_duration_ms(backend_with_sample: LocalBackend) ->
 
 @pytest.mark.asyncio
 async def test_index_library_total_duration_ms(tmpdir: Path) -> None:
-    """LibraryIndexResult.total_duration_ms sums durations across partitions."""
+    """LibraryIndexResult.total_duration_ms is wall-clock time, not the sum of partition times."""
     (tmpdir / "A").mkdir()
     (tmpdir / "B").mkdir()
     (tmpdir / "A" / "p1.jpg").write_bytes(_MINIMAL_JPEG)
     (tmpdir / "B" / "p2.jpg").write_bytes(_MINIMAL_JPEG)
-    backend = LocalBackend(root=str(tmpdir))
+    backend = LocalBackend(root=tmpdir)
 
     result = await index_library(backend)
 
-    assert result.total_duration_ms == sum(p.duration_ms for p in result.partitions)
+    assert isinstance(result.total_duration_ms, int)
     assert result.total_duration_ms >= 0
+    # Wall-clock must be <= sum of partition times (parallelism can only help).
+    assert result.total_duration_ms <= sum(p.duration_ms for p in result.partitions) + 50
+
+
+# ---------------------------------------------------------------------------
+# Parallel indexing
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_index_library_concurrency_capped(tmpdir: Path) -> None:
+    """No more than _MAX_CONCURRENT_PARTITIONS partitions run at the same time."""
+
+    n = _MAX_CONCURRENT_PARTITIONS + 2  # more partitions than the cap
+    for i in range(n):
+        (tmpdir / f"P{i}").mkdir()
+        (tmpdir / f"P{i}" / "photo.jpg").write_bytes(_MINIMAL_JPEG)
+    backend = LocalBackend(root=tmpdir)
+
+    active: list[int] = []
+    peak: list[int] = []
+
+    original_index_partition = index_partition
+
+    async def tracked_index_partition(b, partition, *args, **kwargs):
+        active.append(1)
+        peak.append(len(active))
+        try:
+            return await original_index_partition(b, partition, *args, **kwargs)
+        finally:
+            active.pop()
+
+    with patch("whitebeard.indexer.index_partition", side_effect=tracked_index_partition):
+        await index_library(backend)
+
+    assert max(peak) <= _MAX_CONCURRENT_PARTITIONS
+
+
+@pytest.mark.asyncio
+async def test_index_library_progress_callback_called_for_each_partition(tmpdir: Path) -> None:
+    """on_progress is called exactly once per partition."""
+    for name in ("A", "B", "C"):
+        (tmpdir / name).mkdir()
+        (tmpdir / name / "photo.jpg").write_bytes(_MINIMAL_JPEG)
+    backend = LocalBackend(root=tmpdir)
+
+    calls: list[tuple] = []
+
+    async def on_progress(done, total, partition, duration_ms, photos):
+        calls.append((done, total, partition))
+
+    await index_library(backend, on_progress=on_progress)
+
+    # One call per partition (root "" + A + B + C = 4 partitions)
+    assert len(calls) == 4
+    # 'total' is always the same; 'done' counts up to total
+    totals = {total for _, total, _ in calls}
+    assert totals == {4}
+    assert sorted(done for done, _, _ in calls) == [1, 2, 3, 4]
