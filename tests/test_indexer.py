@@ -509,7 +509,8 @@ async def test_index_mixed_timezone_photos(tmpdir: Path) -> None:
     """
     from datetime import timedelta, timezone
 
-    from ouestcharlie_toolkit.schema import PhotoEntry, VersionToken, XmpSidecar
+    from ouestcharlie_toolkit.backend import VersionToken
+    from ouestcharlie_toolkit.schema import PhotoEntry, XmpSidecar
 
     naive_dt = datetime(2024, 7, 1, 12, 0, 0)
     aware_dt = datetime(2024, 7, 2, 12, 0, 0, tzinfo=timezone(timedelta(hours=2)))
