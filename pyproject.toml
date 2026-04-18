@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ouestcharlie-whitebeard"
-version = "0.5.0"
+version = "0.5.2"
 description = "OuEstCharlie Whitebeard — photo indexer agent for local drives"
 requires-python = ">=3.12"
 readme = "README.md"
