@@ -4,6 +4,8 @@ Whitebeard is the **indexing agent** for OuEstCharlie. It operates in **index mo
 scan an existing local photo library in place (no files moved), create XMP sidecars
 with `ouestcharlie:` fields, and write leaf manifests.
 
+> **More about OuEstCharlie on the [OuEstCharlie Blog](https://ouestcharlie.github.io/ouestcharlie/)**
+
 MCP tool exposed: `index_partition(partition, force=False)`.
 
 ## Project Layout
@@ -41,6 +43,17 @@ uv sync
 ```bash
 .venv/bin/python -m pytest tests/ -v
 ```
+
+## MCP Inspector
+
+Use `mcp dev` from the repo root with a backend config pointing at a local photo folder:
+
+```bash
+WOOF_BACKEND_CONFIG='{"type":"filesystem","root":"/path/to/photos"}' \
+    mcp dev src/whitebeard/__main__.py
+```
+
+> **Note:** The default MCP Inspector timeout is too low for full-library indexing runs. Increase it in the Inspector settings before calling `index_partition`.
 
 ## Context
 
