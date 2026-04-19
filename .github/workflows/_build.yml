@@ -23,10 +23,13 @@ jobs:
       - name: Build
         run: hatch build
 
-      - name: Install package and run tests
-        run: |
-          pip install --find-links dist/ ouestcharlie-whitebeard pytest pytest-asyncio
-          python -m pytest tests/ -v
+      - name: Install package
+        working-directory: dist
+        shell: bash
+        run: pip install ouestcharlie_whitebeard-*.whl pytest pytest-asyncio
+
+      - name: Run tests
+        run: python -m pytest tests/ -v
 
       - uses: actions/upload-artifact@v6
         with:

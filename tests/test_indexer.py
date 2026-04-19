@@ -155,7 +155,7 @@ async def test_index_manifest_summary_rating_range(tmpdir: Path) -> None:
         nonlocal call_count
         r = ratings[call_count]
         call_count += 1
-        sidecar = XmpSidecar(content_hash=f"sha256:{'0' * 63}{call_count}", rating=r)
+        sidecar = XmpSidecar(content_hash=f"KfAbc123A2nBcR8xYvLm1P{call_count}", rating=r)
         entry = PhotoEntry.from_sidecar(
             photo_path.split("/")[-1], sidecar, sidecar.content_hash, "1"
         )
@@ -408,7 +408,7 @@ async def test_index_library_summary_rating_range(tmpdir: Path) -> None:
     backend = LocalBackend(root=tmpdir)
 
     for photo, rating in [("A/p1.jpg", 2), ("A/p2.jpg", 4), ("B/p3.jpg", 5)]:
-        sidecar = XmpSidecar(content_hash=f"sha256:{'0' * 63}{rating}", rating=rating)
+        sidecar = XmpSidecar(content_hash=f"KfAbc123A2nBcR8xYvLm1P{rating}", rating=rating)
         xmp_file = tmpdir / photo.replace(".jpg", ".xmp")
         xmp_file.write_text(serialize_xmp(sidecar), encoding="utf-8")
 
@@ -525,7 +525,7 @@ async def test_index_mixed_timezone_photos(tmpdir: Path) -> None:
         nonlocal call_count
         call_count += 1
         dt = naive_dt if call_count == 1 else aware_dt
-        sidecar = XmpSidecar(content_hash=f"sha256:{'0' * 64}", date_taken=dt)
+        sidecar = XmpSidecar(content_hash="KfAbc123A2nBcR8xYvLm1P", date_taken=dt)
         token = VersionToken(value=1)
         entry = PhotoEntry.from_sidecar(
             photo_path.split("/")[-1], sidecar, sidecar.content_hash, str(token.value)
