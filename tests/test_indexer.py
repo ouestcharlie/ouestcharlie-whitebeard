@@ -220,7 +220,11 @@ async def test_index_force_overwrites_sidecar(
     # original_content = xmp_path.read_text(encoding="utf-8")
     xmp_path.write_text("<!-- overwritten -->", encoding="utf-8")
 
-    result = await index_partition(backend_with_sample, "", force_extract_exif=True)
+    # force_full_index=True is required alongside force_extract_exif so that the photo
+    # is re-processed rather than carried over from the existing manifest.
+    result = await index_partition(
+        backend_with_sample, "", force_extract_exif=True, force_full_index=True
+    )
 
     assert result.sidecars_created == 1
     assert result.sidecars_skipped == 0
@@ -467,7 +471,9 @@ async def test_index_library_idempotent(tmpdir: Path) -> None:
     await index_library(backend)
     result2 = await index_library(backend)
 
-    assert result2.total_photos == 1
+    # In incremental mode, the second run carries over already-indexed photos.
+    assert result2.total_photos == 0  # no newly processed photos
+    assert result2.total_photos_skipped == 1  # one photo carried over from manifest
     assert result2.total_sidecars_created == 0  # sidecar already exists
     assert result2.total_errors == 0
 
@@ -623,3 +629,235 @@ async def test_index_library_progress_callback_called_for_each_partition(tmpdir:
     totals = {total for _, total, _ in calls}
     assert totals == {4}
     assert sorted(done for done, _, _ in calls) == [1, 2, 3, 4]
+
+
+# ---------------------------------------------------------------------------
+# Incremental indexing (force_full_index)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_index_result_has_photos_skipped_and_deleted_fields(
+    backend_with_minimal: LocalBackend,
+) -> None:
+    """IndexResult has photos_skipped and photos_deleted fields, both 0 on first run."""
+    result = await index_partition(backend_with_minimal, "")
+    assert result.photos_skipped == 0
+    assert result.photos_deleted == 0
+
+
+@pytest.mark.asyncio
+async def test_incremental_first_run_processes_all(tmpdir: Path) -> None:
+    """Without an existing manifest, incremental mode processes all photos."""
+    (tmpdir / "a.jpg").write_bytes(_MINIMAL_JPEG)
+    (tmpdir / "b.jpg").write_bytes(_MINIMAL_JPEG)
+    backend = LocalBackend(root=tmpdir)
+
+    result = await index_partition(backend, "")  # force_full_index=False is the default
+
+    assert result.photos_processed == 2
+    assert result.photos_skipped == 0
+    assert result.photos_deleted == 0
+    assert result.errors == 0
+
+
+@pytest.mark.asyncio
+async def test_incremental_skips_already_indexed_photos(tmpdir: Path) -> None:
+    """In incremental mode, photos already in the manifest are not re-processed."""
+    (tmpdir / "photo.jpg").write_bytes(_MINIMAL_JPEG)
+    backend = LocalBackend(root=tmpdir)
+
+    # First run: creates the manifest.
+    result1 = await index_partition(backend, "")
+    assert result1.photos_processed == 1
+    assert result1.photos_skipped == 0
+
+    call_count = 0
+    from whitebeard.indexer import _extract_one as real_extract_one
+
+    async def counting_extract(xmp_store, photo_path, force_extract_exif):
+        nonlocal call_count
+        call_count += 1
+        return await real_extract_one(xmp_store, photo_path, force_extract_exif)
+
+    with patch("whitebeard.indexer._extract_one", side_effect=counting_extract):
+        result2 = await index_partition(backend, "")
+
+    assert result2.photos_processed == 0
+    assert result2.photos_skipped == 1
+    assert result2.photos_deleted == 0
+    assert result2.errors == 0
+    assert call_count == 0  # _extract_one was never called
+
+
+@pytest.mark.asyncio
+async def test_incremental_processes_new_photos_in_existing_partition(tmpdir: Path) -> None:
+    """In incremental mode, only photos absent from the manifest are processed."""
+    (tmpdir / "existing.jpg").write_bytes(_MINIMAL_JPEG)
+    backend = LocalBackend(root=tmpdir)
+
+    # First run: index existing.jpg.
+    result1 = await index_partition(backend, "")
+    assert result1.photos_processed == 1
+
+    # Add a new photo.
+    (tmpdir / "new.jpg").write_bytes(_MINIMAL_JPEG)
+
+    result2 = await index_partition(backend, "")
+
+    assert result2.photos_processed == 1  # only new.jpg
+    assert result2.photos_skipped == 1  # existing.jpg carried over
+    assert result2.photos_deleted == 0
+    assert result2.errors == 0
+
+    # Both photos must appear in the manifest.
+    manifest_store = ManifestStore(backend)
+    manifest, _ = await manifest_store.read_leaf("")
+    filenames = {e.filename for e in manifest.photos}
+    assert "existing.jpg" in filenames
+    assert "new.jpg" in filenames
+
+
+@pytest.mark.asyncio
+async def test_incremental_removes_deleted_photos_from_manifest(
+    tmpdir: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Photos deleted from disk are counted, logged, and removed from the manifest."""
+    (tmpdir / "keep.jpg").write_bytes(_MINIMAL_JPEG)
+    (tmpdir / "delete.jpg").write_bytes(_MINIMAL_JPEG)
+    backend = LocalBackend(root=tmpdir)
+
+    # First run: both photos indexed.
+    await index_partition(backend, "")
+
+    # Remove one photo from disk.
+    (tmpdir / "delete.jpg").unlink()
+
+    with caplog.at_level(logging.INFO, logger="whitebeard.indexer"):
+        result = await index_partition(backend, "")
+
+    assert result.photos_deleted == 1
+    assert result.photos_skipped == 1  # keep.jpg carried over
+    assert result.photos_processed == 0
+
+    # "delete.jpg" must appear in the INFO log.
+    assert any("delete.jpg" in record.message for record in caplog.records)
+
+    # Manifest must only contain keep.jpg.
+    manifest_store = ManifestStore(backend)
+    manifest, _ = await manifest_store.read_leaf("")
+    filenames = {e.filename for e in manifest.photos}
+    assert "keep.jpg" in filenames
+    assert "delete.jpg" not in filenames
+
+
+@pytest.mark.asyncio
+async def test_force_full_index_reprocesses_all_photos(tmpdir: Path) -> None:
+    """force_full_index=True re-processes all photos even if manifest is current."""
+    (tmpdir / "photo.jpg").write_bytes(_MINIMAL_JPEG)
+    backend = LocalBackend(root=tmpdir)
+
+    await index_partition(backend, "")  # first run
+
+    call_count = 0
+    from whitebeard.indexer import _extract_one as real_extract_one
+
+    async def counting_extract(xmp_store, photo_path, force_extract_exif):
+        nonlocal call_count
+        call_count += 1
+        return await real_extract_one(xmp_store, photo_path, force_extract_exif)
+
+    with patch("whitebeard.indexer._extract_one", side_effect=counting_extract):
+        result = await index_partition(backend, "", force_full_index=True)
+
+    assert result.photos_processed == 1
+    assert result.photos_skipped == 0
+    assert result.photos_deleted == 0
+    assert call_count == 1  # _extract_one was called despite existing manifest
+
+
+@pytest.mark.asyncio
+async def test_index_library_incremental_skips_already_indexed(tmpdir: Path) -> None:
+    """Second library run in incremental mode skips already-indexed photos."""
+    (tmpdir / "A").mkdir()
+    (tmpdir / "A" / "p.jpg").write_bytes(_MINIMAL_JPEG)
+    backend = LocalBackend(root=tmpdir)
+
+    await index_library(backend)  # initial run
+
+    result = await index_library(backend)  # incremental second run
+
+    partition_a = next(r for r in result.partitions if r.partition == "A")
+    assert partition_a.photos_skipped == 1
+    assert partition_a.photos_processed == 0
+    assert result.total_photos_skipped >= 1
+
+
+@pytest.mark.asyncio
+async def test_index_library_force_full_index_reprocesses_all(tmpdir: Path) -> None:
+    """index_library with force_full_index=True reprocesses all photos."""
+    (tmpdir / "A").mkdir()
+    (tmpdir / "A" / "p.jpg").write_bytes(_MINIMAL_JPEG)
+    backend = LocalBackend(root=tmpdir)
+
+    await index_library(backend)  # initial run
+
+    result = await index_library(backend, force_full_index=True)
+
+    for r in result.partitions:
+        assert r.photos_skipped == 0
+
+
+@pytest.mark.asyncio
+async def test_incremental_skips_thumbnail_when_no_change(tmpdir: Path) -> None:
+    """In incremental mode, thumbnails are not regenerated when no new photos exist."""
+    (tmpdir / "photo.jpg").write_bytes(_MINIMAL_JPEG)
+    backend = LocalBackend(root=tmpdir)
+
+    await index_partition(backend, "")  # first run
+
+    thumbnail_call_count = 0
+
+    async def counting_thumbnails(b, partition, entries, tier):
+        nonlocal thumbnail_call_count
+        thumbnail_call_count += 1
+        return []
+
+    with patch(
+        "ouestcharlie_toolkit.thumbnail_builder.generate_partition_thumbnails",
+        side_effect=counting_thumbnails,
+    ):
+        result = await index_partition(backend, "", generate_thumbnails=True)
+
+    assert result.thumbnails_rebuilt is False
+    assert thumbnail_call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_incremental_generates_new_thumbnail_chunk_when_photo_added(
+    tmpdir: Path,
+) -> None:
+    """In incremental mode, a new thumbnail chunk is generated for new photos only."""
+    (tmpdir / "existing.jpg").write_bytes(_MINIMAL_JPEG)
+    backend = LocalBackend(root=tmpdir)
+
+    await index_partition(backend, "")  # first run
+
+    (tmpdir / "new.jpg").write_bytes(_MINIMAL_JPEG)  # add a new photo
+
+    thumbnail_call_args: list = []
+
+    async def capturing_thumbnails(b, partition, entries, tier):
+        thumbnail_call_args.append([e.filename for e in entries])
+        return []
+
+    with patch(
+        "ouestcharlie_toolkit.thumbnail_builder.generate_partition_thumbnails",
+        side_effect=capturing_thumbnails,
+    ):
+        result = await index_partition(backend, "", generate_thumbnails=True)
+
+    assert result.thumbnails_rebuilt is True
+    assert len(thumbnail_call_args) == 1
+    # Only the new photo must be passed to the thumbnail builder.
+    assert thumbnail_call_args[0] == ["new.jpg"]

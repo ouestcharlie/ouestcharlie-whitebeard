@@ -17,27 +17,28 @@ src/whitebeard/
 
 ## MCP Tools
 
-### `index_partition(partition, force_extract_exif=False, generate_thumbnails=True)`
+### `index_partition(partition, force_extract_exif=False, generate_thumbnails=True, force_full_index=False)`
 
 Indexes all photos directly in one folder (direct children only — subdirectories are separate partitions).
 
 **Steps:**
 1. List photo files in `partition` via `backend.list_files(partition, PHOTO_EXTENSIONS)`.
-2. For each photo: read or create XMP sidecar (`XmpStore.read_or_create_from_picture`). If `force_extract_exif=True`, re-extract and overwrite.
-3. If `generate_thumbnails=True`, call `generate_partition_thumbnails` to build the AVIF grid (256 px tiles). This is multi-threaded internally.
-4. Create or update the leaf manifest at `<partition>/.ouestcharlie/manifest.json` (`_upsert_leaf_manifest`).
-5. Atomically update the backend-wide `summary.json` (`ManifestStore.upsert_partition_in_summary`).
+2. **Incremental check (default, `force_full_index=False`):** Read the existing leaf manifest (if any) and build a `filename → PhotoEntry` dict.  Photos already present are carried over without calling `_extract_one`.  Photos removed from disk since the last index are counted and logged at INFO level.  With `force_full_index=True`, skip this step and re-process all photos.
+3. For each new photo (or all photos when `force_full_index=True`): read or create XMP sidecar (`XmpStore.read_or_create_from_picture`). If `force_extract_exif=True`, re-extract and overwrite.
+4. If `generate_thumbnails=True` and new photos were added, call `generate_partition_thumbnails` for the **new photos only** and append the resulting chunk to the existing thumbnail chunks.  With `force_full_index=True`, regenerate for all photos (replaces existing chunks).
+5. Create or update the leaf manifest at `<partition>/.ouestcharlie/manifest.json` (`_upsert_leaf_manifest`).
+6. Atomically update the backend-wide `summary.json` (`ManifestStore.upsert_partition_in_summary`).
 
-**Returns:** `IndexResult` (photos processed, sidecars created/skipped, errors, duration).
+**Returns:** `IndexResult` (photos processed, skipped, deleted, sidecars created/skipped, errors, duration).
 
-### `index_library(root="", force_extract_exif=False, generate_thumbnails=True)`
+### `index_library(root="", force_extract_exif=False, generate_thumbnails=True, force_full_index=False)`
 
 Recursively indexes the entire library under `root`.
 
 **Steps:**
 1. BFS-walk the directory tree from `root`. Hidden directories (name starts with `.`) are skipped — they are metadata or system folders.
-2. Dispatch collected partitions to `index_partition` in parallel, capped at `_MAX_CONCURRENT_PARTITIONS = 4` concurrent workers (via `asyncio.Semaphore`). The cap is kept low because thumbnail generation is already multi-threaded; going wider would over-saturate I/O.
-3. Progress is reported after each partition completes (not while it is running).
+2. Dispatch collected partitions to `index_partition` in parallel, capped at `_MAX_CONCURRENT_PARTITIONS = 4` concurrent workers (via `asyncio.Semaphore`). The cap is kept low because thumbnail generation is already multi-threaded; going wider would over-saturate I/O.  Passes `force_full_index` through to each call.
+3. Progress is reported after each partition completes (not while it is running), with the photo count reflecting both processed and skipped photos.
 
 **Returns:** `LibraryIndexResult` aggregating all per-partition `IndexResult` values.
 
@@ -59,6 +60,26 @@ index_library
 Each `index_partition` call is independent: it writes its own `manifest.json` and then calls `upsert_partition_in_summary` to update the shared `summary.json`. The latter uses optimistic concurrency (read-modify-write with up to 5 retries on version conflict), so concurrent writes are safe — the only observable effect of parallelism is more frequent retries under high partition counts.
 
 `LibraryIndexResult.partitions` preserves the BFS discovery order (same order as the input `partitions` list), because `asyncio.gather` returns results in submission order.
+
+## Incremental Indexing
+
+By default both `index_partition` and `index_library` run in **incremental mode** (`force_full_index=False`).
+
+At the start of each `index_partition` call, the existing leaf manifest (if any) is read and a `filename → PhotoEntry` dict is built.  For each photo file found on disk:
+
+- **Already in manifest** → the existing `PhotoEntry` is reused without calling `_extract_one`.  No sidecar I/O, no EXIF read.  Counted in `IndexResult.photos_skipped`.
+- **Not in manifest** → `_extract_one` is called as usual.  Counted in `IndexResult.photos_processed`.
+- **In manifest but not on disk** → absent from the merged list; the manifest is updated without that entry (stale entries are garbage-collected).  Counted in `IndexResult.photos_deleted` and logged at INFO level.
+
+The first run against a partition with no existing manifest behaves identically to `force_full_index=True` — all photos are processed.
+
+**Thumbnail strategy in incremental mode:** only new photos (those not previously in the manifest) are passed to `generate_partition_thumbnails`.  The resulting new AVIF chunk is appended to the existing `thumbnail_chunks` list in the manifest.  Existing AVIF files are immutable (content-addressed) and are never modified or deleted.  If no new photos are present, thumbnails are not regenerated.
+
+**`force_full_index=True`** skips the manifest read, re-processes every photo, and regenerates thumbnails for the full photo set (replacing existing chunks).  This is equivalent to the previous unconditional behaviour.
+
+**`force_full_index` and `force_extract_exif` are orthogonal.**  Using `force_extract_exif=True` alone does not trigger re-indexing of already-manifest photos in incremental mode — the photo is carried over as-is.  To regenerate both the manifest entry and the XMP sidecar, use both flags together.
+
+**Known limitation:** changes to a photo's EXIF data or XMP sidecar after the initial index are **not detected** in incremental mode.  The photo is already in the manifest and is carried over without re-reading its metadata.  Use `force_full_index=True` (and optionally `force_extract_exif=True`) to pick up metadata changes.
 
 ## Leaf Manifest Upsert (`_upsert_leaf_manifest`)
 
