@@ -109,7 +109,6 @@ class WhitebeardAgent(AgentBase):
         @mcp.tool(name="index_library")
         async def index_library_tool(
             ctx: Context,
-            root: str = "",
             force_extract_exif: bool = False,
             generate_thumbnails: bool = True,
             force_full_index: bool = False,
@@ -121,14 +120,17 @@ class WhitebeardAgent(AgentBase):
             Use ``force_full_index=True`` to re-process all photos across the
             entire library.
 
-            Walks every subfolder under ``root``, indexes each folder that
-            contains photos as a leaf partition (creating XMP sidecars and AVIF
-            thumbnail grids), then builds parent manifests bottom-up so every
-            ancestor folder has an aggregate manifest summarising its children.
+            Walks every subfolder under the backend root, indexes each folder
+            that contains photos as a leaf partition (creating XMP sidecars and
+            AVIF thumbnail grids), then builds parent manifests bottom-up so
+            every ancestor folder has an aggregate manifest summarising its
+            children.
+
+            After indexing, partitions present in ``summary.json`` but no longer
+            on disk are removed from the summary and their
+            ``.ouestcharlie/<partition>/`` metadata directories are deleted.
 
             Args:
-                root: Library root relative to the backend root.  Defaults to
-                    ``""`` (the entire backend).
                 force_extract_exif: Re-extract EXIF and overwrite existing
                     XMP sidecars.  Defaults to False.
                 generate_thumbnails: Generate ``thumbnails.avif`` AVIF grids
@@ -138,6 +140,7 @@ class WhitebeardAgent(AgentBase):
 
             Returns:
                 ``partitionsIndexed`` — number of leaf partitions processed.
+                ``partitionsDeleted`` — stale partitions removed from summary.
                 ``totalPhotos`` — photos indexed in this run (new or force-reindexed).
                 ``totalPhotosSkipped`` — photos carried over from existing manifests.
                 ``totalPhotosDeleted`` — photos removed from disk across all partitions.
@@ -161,17 +164,17 @@ class WhitebeardAgent(AgentBase):
             try:
                 result = await index_library(
                     self.backend,
-                    root=root,
                     force_extract_exif=force_extract_exif,
                     generate_thumbnails=generate_thumbnails,
                     force_full_index=force_full_index,
                     on_progress=_library_progress,
                 )
             except Exception as exc:
-                _log.error("index_library failed — root=%r: %s", root, exc, exc_info=True)
+                _log.error("index_library failed: %s", exc, exc_info=True)
                 raise
             return {
                 "partitionsIndexed": len(result.partitions),
+                "partitionsDeleted": result.partitions_deleted,
                 "totalPhotos": result.total_photos,
                 "totalPhotosSkipped": result.total_photos_skipped,
                 "totalPhotosDeleted": result.total_photos_deleted,

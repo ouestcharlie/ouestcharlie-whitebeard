@@ -22,25 +22,36 @@ src/whitebeard/
 Indexes all photos directly in one folder (direct children only — subdirectories are separate partitions).
 
 **Steps:**
-1. List photo files in `partition` via `backend.list_files(partition, PHOTO_EXTENSIONS)`.
-2. **Incremental check (default, `force_full_index=False`):** Read the existing leaf manifest (if any) and build a `filename → PhotoEntry` dict.  Photos already present are carried over without calling `_extract_one`.  Photos removed from disk since the last index are counted and logged at INFO level.  With `force_full_index=True`, skip this step and re-process all photos.
-3. For each new photo (or all photos when `force_full_index=True`): read or create XMP sidecar (`XmpStore.read_or_create_from_picture`). If `force_extract_exif=True`, re-extract and overwrite.
-4. If `generate_thumbnails=True` and new photos were added, call `generate_partition_thumbnails` for the **new photos only** and append the resulting chunk to the existing thumbnail chunks.  With `force_full_index=True`, regenerate for all photos (replaces existing chunks).
-5. Create or update the leaf manifest at `<partition>/.ouestcharlie/manifest.json` (`_upsert_leaf_manifest`).
-6. Atomically update the backend-wide `summary.json` (`ManifestStore.upsert_partition_in_summary`).
+1. Read existing manifest (if any) to build `existing_by_filename` dict for incremental mode.
+2. List photo files in `partition` via `backend.list_files(partition, PHOTO_EXTENSIONS)`.
+3. Detect photos present in the existing manifest but no longer on disk — log them and exclude from the updated manifest.
+4. For each photo: if already in the manifest and `force_full_index=False`, skip it (incremental). Otherwise read or create XMP sidecar (`XmpStore.read_or_create_from_picture`). If `force_extract_exif=True`, re-extract and overwrite.
+5. If `generate_thumbnails=True` and there are new photos, call `generate_partition_thumbnails` with only the newly-processed photos (or all photos when `force_full_index=True`). This is multi-threaded internally.
+6. Create or update the leaf manifest at `<partition>/.ouestcharlie/manifest.json` (`_upsert_leaf_manifest`). The already-read manifest and version token are passed as `prefetched` to avoid a second backend read.
+7. Atomically update the backend-wide `summary.json` (`ManifestStore.upsert_partition_in_summary`).
 
 **Returns:** `IndexResult` (photos processed, skipped, deleted, sidecars created/skipped, errors, duration).
 
-### `index_library(root="", force_extract_exif=False, generate_thumbnails=True, force_full_index=False)`
+### `index_library(force_extract_exif=False, generate_thumbnails=True, force_full_index=False)`
 
-Recursively indexes the entire library under `root`.
+Indexes the entire library under the backend root.
 
 **Steps:**
-1. BFS-walk the directory tree from `root`. Hidden directories (name starts with `.`) are skipped — they are metadata or system folders.
-2. Dispatch collected partitions to `index_partition` in parallel, capped at `_MAX_CONCURRENT_PARTITIONS = 4` concurrent workers (via `asyncio.Semaphore`). The cap is kept low because thumbnail generation is already multi-threaded; going wider would over-saturate I/O.  Passes `force_full_index` through to each call.
-3. Progress is reported after each partition completes (not while it is running), with the photo count reflecting both processed and skipped photos.
+1. BFS-walk the full directory tree from `""`. Hidden directories (name starts with `.`) are skipped — they are metadata or system folders.
+2. Dispatch collected partitions to `index_partition` in parallel, capped at `_MAX_CONCURRENT_PARTITIONS = 4` concurrent workers (via `asyncio.Semaphore`). The cap is kept low because thumbnail generation is already multi-threaded; going wider would over-saturate I/O.
+3. Progress is reported after each partition completes (not while it is running).
+4. After all partitions are indexed, compare the discovered partition set against `summary.json`. Remove stale entries (partitions no longer on disk) from `summary.json` and delete their `.ouestcharlie/<partition>/` metadata directories via `backend.delete_dir()`.
 
-**Returns:** `LibraryIndexResult` aggregating all per-partition `IndexResult` values.
+**Returns:** `LibraryIndexResult` aggregating all per-partition `IndexResult` values plus `partitions_deleted`.
+
+## Incremental Indexing
+
+Whitebeard defaults to incremental mode — photos already present in the existing leaf manifest are skipped without re-reading their XMP sidecars or re-extracting EXIF. Only new photos (filenames not in the manifest) are processed.
+
+- **Deleted photos**: photos in the manifest but not on disk are logged at INFO level and excluded from the updated manifest. Their XMP sidecars are left in place.
+- **Deleted partitions**: partitions in `summary.json` but no longer on disk are removed from the summary and their `.ouestcharlie/<partition>/` metadata directories are deleted after the gather step in `index_library`.
+- **EXIF changes**: changes to EXIF fields in an already-indexed photo are NOT detected in incremental mode. Use `force_extract_exif=True` together with `force_full_index=True` to refresh all metadata.
+- **Thumbnail strategy**: new AVIF chunks are generated only for newly-processed photos and appended to the existing chunk list. `force_full_index=True` replaces the chunk list entirely.
 
 ## Concurrency Model
 
@@ -55,13 +66,15 @@ index_library
   │     ├── Semaphore(4) → index_partition("2024/Apr/")
   │     │     (queued)
   │     └── ...
+  │
+  └── _prune_deleted_partitions (sequential, after gather)
 ```
 
 Each `index_partition` call is independent: it writes its own `manifest.json` and then calls `upsert_partition_in_summary` to update the shared `summary.json`. The latter uses optimistic concurrency (read-modify-write with up to 5 retries on version conflict), so concurrent writes are safe — the only observable effect of parallelism is more frequent retries under high partition counts.
 
 `LibraryIndexResult.partitions` preserves the BFS discovery order (same order as the input `partitions` list), because `asyncio.gather` returns results in submission order.
 
-## Incremental Indexing
+## Incremental Indexing (Detail)
 
 By default both `index_partition` and `index_library` run in **incremental mode** (`force_full_index=False`).
 
@@ -84,13 +97,27 @@ The first run against a partition with no existing manifest behaves identically 
 ## Leaf Manifest Upsert (`_upsert_leaf_manifest`)
 
 - Computes `ManifestSummary.from_photos()` from the current photo entries.
-- Reads the existing manifest if one exists, to preserve unknown fields (`_extra`) and existing thumbnail chunks.
+- Accepts a `prefetched: tuple[LeafManifest, VersionToken] | None` parameter. When provided (as it always is in `index_partition` after the incremental pre-scan), skips the redundant `read_leaf` call.
+- Reads the existing manifest if one exists and `prefetched` is `None`, to preserve unknown fields (`_extra`) and existing thumbnail chunks.
+- Thumbnail chunk merging: new chunks are computed and merged in `index_partition` before calling this helper; `_upsert_leaf_manifest` receives the final `thumbnail_chunks` list directly.
 - Writes back with optimistic concurrency (`write_leaf` on existing, `create_leaf` on first index).
-- If `thumbnail_chunks` is provided, replaces the stored chunks; otherwise preserves the existing ones.
 
 ## XMP Sidecar Handling
 
 Delegated entirely to `XmpStore.read_or_create_from_picture` from `ouestcharlie_toolkit`. Whitebeard never reads XMP files directly — it receives a `(XmpSidecar, VersionToken, created)` tuple and converts it to a `PhotoEntry` via `PhotoEntry.from_sidecar`.
+
+## Deleted Partition Cleanup (`_prune_deleted_partitions`)
+
+Called by `index_library` after the gather step. Compares the BFS-discovered partition set against the existing `summary.json`:
+
+1. Reads `summary.json` (returns 0 immediately if not found).
+2. Identifies stale partitions (in summary but not discovered by BFS).
+3. For each stale partition, calls `_delete_partition_metadata` which delegates to `backend.delete_dir()`.
+4. Writes the pruned `summary.json` via `write_summary`.
+
+`backend.delete_dir()` uses `shutil.rmtree` with an `onexc` callback (Python 3.12+): locked or open files are logged at WARNING and skipped rather than aborting the whole tree. Summary pruning happens regardless of deletion success — a partial cleanup is acceptable; the next library run will retry remaining files.
+
+A safety guard in `_delete_partition_metadata` verifies the computed metadata path starts with `.ouestcharlie/` before deletion.
 
 ## Error Isolation
 

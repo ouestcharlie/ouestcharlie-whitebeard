@@ -217,7 +217,6 @@ async def test_index_force_overwrites_sidecar(
 
     # Overwrite the sidecar with a sentinel.
     xmp_path = tmpdir / "001.xmp"
-    # original_content = xmp_path.read_text(encoding="utf-8")
     xmp_path.write_text("<!-- overwritten -->", encoding="utf-8")
 
     # force_full_index=True is required alongside force_extract_exif so that the photo
@@ -644,6 +643,7 @@ async def test_index_result_has_photos_skipped_and_deleted_fields(
     result = await index_partition(backend_with_minimal, "")
     assert result.photos_skipped == 0
     assert result.photos_deleted == 0
+    assert result.errors == 0
 
 
 @pytest.mark.asyncio
@@ -861,3 +861,89 @@ async def test_incremental_generates_new_thumbnail_chunk_when_photo_added(
     assert len(thumbnail_call_args) == 1
     # Only the new photo must be passed to the thumbnail builder.
     assert thumbnail_call_args[0] == ["new.jpg"]
+
+
+# ---------------------------------------------------------------------------
+# Deleted partition cleanup
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_index_library_removes_stale_partition_from_summary(tmpdir: Path) -> None:
+    """After a partition directory is deleted, the next library run removes it from summary.json."""
+    (tmpdir / "A").mkdir()
+    (tmpdir / "A" / "p.jpg").write_bytes(_MINIMAL_JPEG)
+    (tmpdir / "B").mkdir()
+    (tmpdir / "B" / "p.jpg").write_bytes(_MINIMAL_JPEG)
+    backend = LocalBackend(root=tmpdir)
+
+    await index_library(backend)
+
+    # Delete partition B from disk.
+    shutil.rmtree(tmpdir / "B")
+
+    result = await index_library(backend)
+
+    summary_data = json.loads((tmpdir / ".ouestcharlie" / "summary.json").read_text())
+    paths = {p["path"] for p in summary_data["partitions"]}
+    assert "B" not in paths
+    assert result.partitions_deleted == 1
+
+
+@pytest.mark.asyncio
+async def test_index_library_deletes_stale_partition_metadata_files(tmpdir: Path) -> None:
+    """After a partition directory is deleted, the next library run deletes its metadata dir."""
+    (tmpdir / "A").mkdir()
+    (tmpdir / "A" / "p.jpg").write_bytes(_MINIMAL_JPEG)
+    backend = LocalBackend(root=tmpdir)
+
+    await index_library(backend)
+
+    # Confirm metadata dir was created.
+    metadata_dir = tmpdir / ".ouestcharlie" / "A"
+    assert metadata_dir.exists()
+
+    # Delete partition A from disk.
+    shutil.rmtree(tmpdir / "A")
+
+    await index_library(backend)
+
+    assert not metadata_dir.exists()
+
+
+@pytest.mark.asyncio
+async def test_index_library_does_not_touch_active_partitions(tmpdir: Path) -> None:
+    """Active partitions are left intact when a different partition is deleted."""
+    (tmpdir / "Keep").mkdir()
+    (tmpdir / "Keep" / "p.jpg").write_bytes(_MINIMAL_JPEG)
+    (tmpdir / "Gone").mkdir()
+    (tmpdir / "Gone" / "p.jpg").write_bytes(_MINIMAL_JPEG)
+    backend = LocalBackend(root=tmpdir)
+
+    await index_library(backend)
+    shutil.rmtree(tmpdir / "Gone")
+    await index_library(backend)
+
+    # Keep partition's manifest must still exist.
+    assert (tmpdir / ".ouestcharlie" / "Keep" / "manifest.json").exists()
+    summary_data = json.loads((tmpdir / ".ouestcharlie" / "summary.json").read_text())
+    paths = {p["path"] for p in summary_data["partitions"]}
+    assert "Keep" in paths
+
+
+@pytest.mark.asyncio
+async def test_index_library_partitions_deleted_count(tmpdir: Path) -> None:
+    """partitions_deleted reflects the number of stale partitions removed."""
+    for name in ("X", "Y", "Z"):
+        (tmpdir / name).mkdir()
+        (tmpdir / name / "p.jpg").write_bytes(_MINIMAL_JPEG)
+    backend = LocalBackend(root=tmpdir)
+
+    await index_library(backend)
+
+    shutil.rmtree(tmpdir / "X")
+    shutil.rmtree(tmpdir / "Z")
+
+    result = await index_library(backend)
+
+    assert result.partitions_deleted == 2
