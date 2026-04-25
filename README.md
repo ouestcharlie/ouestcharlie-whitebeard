@@ -6,7 +6,7 @@ with `ouestcharlie:` fields, and write leaf manifests.
 
 > **More about OuEstCharlie on the [OuEstCharlie Blog](https://ouestcharlie.github.io/ouestcharlie/)**
 
-MCP tool exposed: `index_partition(partition, force=False)`.
+MCP tools: `index_partition` and `index_library`, both incremental by default (`force_full_index=False`).
 
 ## Project Layout
 
@@ -43,6 +43,12 @@ uv sync
 ```bash
 .venv/bin/python -m pytest tests/ -v
 ```
+
+## Incremental vs Force Indexing
+
+By default, both `index_partition` and `index_library` run in **incremental mode**: photos already present in the partition manifest are carried over without re-processing. Only photos missing from the manifest are indexed. Photos deleted from disk are automatically removed from the manifest on the next run.
+
+To re-process all photos regardless of their manifest state, pass `force_full_index=True`. To also regenerate XMP sidecars specifically, add `force_extract_exif=True`.
 
 ## MCP Inspector
 
