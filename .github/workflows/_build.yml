@@ -16,7 +16,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           repository: ouestcharlie/ouestcharlie-py-toolkit
-          path: ../ouestcharlie-py-toolkit
+          path: deps/ouestcharlie-py-toolkit
 
       - uses: actions/setup-python@v6
         with:
@@ -26,7 +26,7 @@ jobs:
         run: pip install hatch
 
       - name: Install toolkit (editable)
-        run: pip install -e ../ouestcharlie-py-toolkit
+        run: pip install -e deps/ouestcharlie-py-toolkit
 
       - name: Build
         run: hatch build
