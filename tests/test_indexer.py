@@ -12,7 +12,7 @@ from unittest.mock import patch
 import pytest
 from ouestcharlie_toolkit.backends.local import LocalBackend
 from ouestcharlie_toolkit.manifest import ManifestStore, ManifestSummary
-from ouestcharlie_toolkit.schema import METADATA_DIR
+from ouestcharlie_toolkit.schema import METADATA_DIR, SCHEMA_VERSION, RootSummary
 from ouestcharlie_toolkit.xmp import parse_xmp
 
 from whitebeard.indexer import (
@@ -607,6 +607,51 @@ async def test_index_library_concurrency_capped(tmpdir: Path) -> None:
     assert max(peak) <= _MAX_CONCURRENT_PARTITIONS
 
 
+# ---------------------------------------------------------------------------
+# Schema version upgrade
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_index_library_forces_full_reindex_on_schema_upgrade(tmpdir: Path) -> None:
+    """When summary.json has an older schemaVersion, index_library forces a full reindex."""
+    (tmpdir / "A").mkdir()
+    (tmpdir / "A" / "p.jpg").write_bytes(_MINIMAL_JPEG)
+    backend = LocalBackend(root=tmpdir)
+
+    # First index — creates manifests with the current SCHEMA_VERSION.
+    await index_library(backend)
+
+    # Downgrade the summary schema version to simulate an old index.
+    store = ManifestStore(backend)
+    current_summary, version = await store.read_summary()
+    stale = RootSummary(
+        schema_version=SCHEMA_VERSION - 1,
+        partitions=current_summary.partitions,
+    )
+    await store.write_summary(stale, version)
+
+    # Second run (incremental by default) — must detect stale version and force full reindex.
+    result = await index_library(backend)
+
+    assert result.total_photos > 0  # all photos re-processed, none skipped
+    assert result.total_photos_skipped == 0
+
+
+@pytest.mark.asyncio
+async def test_index_library_no_forced_reindex_when_schema_current(tmpdir: Path) -> None:
+    """When the schema version is current, a second run stays incremental."""
+    (tmpdir / "A").mkdir()
+    (tmpdir / "A" / "p.jpg").write_bytes(_MINIMAL_JPEG)
+    backend = LocalBackend(root=tmpdir)
+
+    await index_library(backend)
+    result = await index_library(backend)  # incremental — schema version matches
+
+    assert result.total_photos == 0  # no re-processing
+    assert result.total_photos_skipped > 0  # photo carried over from manifest
+
+
 @pytest.mark.asyncio
 async def test_index_library_progress_callback_called_for_each_partition(tmpdir: Path) -> None:
     """on_progress is called exactly once per partition."""
@@ -824,7 +869,7 @@ async def test_incremental_skips_thumbnail_when_no_change(tmpdir: Path) -> None:
         return []
 
     with patch(
-        "ouestcharlie_toolkit.thumbnail_builder.generate_partition_thumbnails",
+        "whitebeard.indexer.generate_partition_thumbnails",
         side_effect=counting_thumbnails,
     ):
         result = await index_partition(backend, "", generate_thumbnails=True)
@@ -852,7 +897,7 @@ async def test_incremental_generates_new_thumbnail_chunk_when_photo_added(
         return []
 
     with patch(
-        "ouestcharlie_toolkit.thumbnail_builder.generate_partition_thumbnails",
+        "whitebeard.indexer.generate_partition_thumbnails",
         side_effect=capturing_thumbnails,
     ):
         result = await index_partition(backend, "", generate_thumbnails=True)
