@@ -21,6 +21,10 @@ from ouestcharlie_toolkit.schema import (
     RootSummary,
     ThumbnailChunk,
 )
+from ouestcharlie_toolkit.thumbnail_builder import (
+    delete_partition_thumbnails,
+    generate_partition_thumbnails,
+)
 from ouestcharlie_toolkit.xmp import XmpStore
 
 _log = logging.getLogger(__name__)
@@ -224,12 +228,9 @@ async def index_partition(
         thumbnail_chunks_to_write: list[ThumbnailChunk] | None = None
         if generate_thumbnails:
             if force_full_index:
+                await delete_partition_thumbnails(backend, partition)
                 if photo_entries:
                     try:
-                        from ouestcharlie_toolkit.thumbnail_builder import (
-                            generate_partition_thumbnails,
-                        )
-
                         thumbnail_chunks_to_write = await generate_partition_thumbnails(
                             backend, partition, photo_entries, tier="thumbnail"
                         )
@@ -246,10 +247,6 @@ async def index_partition(
             elif new_entries:
                 # Incremental: thumbnail only new photos, then append chunk to existing ones.
                 try:
-                    from ouestcharlie_toolkit.thumbnail_builder import (
-                        generate_partition_thumbnails,
-                    )
-
                     new_chunks = await generate_partition_thumbnails(
                         backend, partition, new_entries, tier="thumbnail"
                     )
@@ -328,6 +325,22 @@ async def index_library(
     """
     library_result = LibraryIndexResult()
     manifest_store = ManifestStore(backend)
+
+    # If the existing index was built with an older schema version, force a full
+    # reindex so all manifests and thumbnails are regenerated to the current schema.
+    try:
+        existing_summary, _ = await manifest_store.read_summary()
+        if existing_summary.schema_version < SCHEMA_VERSION:
+            _log.info(
+                "index_library — schema version %d < %d, forcing full reindex",
+                existing_summary.schema_version,
+                SCHEMA_VERSION,
+            )
+            force_full_index = True
+    except FileNotFoundError:
+        pass  # No existing index — first run, nothing to upgrade.
+    except Exception as exc:
+        _log.warning("index_library — could not read summary.json for version check: %s", exc)
 
     # Walk the directory tree from the backend root via BFS, collecting all
     # partitions.  Hidden directories (names starting with ".") are skipped —
