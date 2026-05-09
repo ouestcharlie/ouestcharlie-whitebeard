@@ -154,78 +154,109 @@ async def index_partition(
     xmp_store = XmpStore(backend)
     manifest_store = ManifestStore(backend)
 
-    # List only direct-child photo files in the partition.
+    # List only direct-child photo files — read-only, no lock needed.
     photo_files = await backend.list_files(partition, PHOTO_EXTENSIONS)
     disk_filenames: set[str] = {PurePath(f.path).name for f in photo_files}
 
-    # In incremental mode, load the existing manifest to determine which photos
-    # are already indexed.  In force mode, skip this read entirely.
-    existing_by_filename: dict[str, PhotoEntry] = {}
-    existing_manifest: LeafManifest | None = None
-    existing_version: VersionToken | None = None
-    if not force_full_index:
-        try:
-            existing_manifest, existing_version = await manifest_store.read_leaf(partition)
-            existing_by_filename = {e.filename: e for e in existing_manifest.photos}
-            # Count and log photos that have been deleted from disk since the last index.
-            deleted_filenames = existing_by_filename.keys() - disk_filenames
-            result.photos_deleted = len(deleted_filenames)
-            if deleted_filenames:
-                _log.info(
-                    "Incremental index — %d photo(s) removed from disk since last index"
-                    " — partition=%r: %s",
-                    len(deleted_filenames),
-                    partition,
-                    ", ".join(sorted(deleted_filenames)),
-                )
-        except FileNotFoundError:
-            pass  # First run — no manifest yet, treat all photos as new.
-
-    photo_entries: list[PhotoEntry] = []
-
-    for file_info in photo_files:
-        filename = PurePath(file_info.path).name
-        if force_full_index or filename not in existing_by_filename:
-            result.photos_processed += 1
+    # Hold the partition lock for the entire read → process → write cycle so
+    # that no other agent can interleave writes on the same partition.
+    summary = None
+    async with backend.partition_lock(partition):
+        # In incremental mode, load the existing manifest inside the lock so
+        # the version token remains valid for the subsequent write_leaf call.
+        existing_by_filename: dict[str, PhotoEntry] = {}
+        existing_manifest: LeafManifest | None = None
+        existing_version: VersionToken | None = None
+        if not force_full_index:
             try:
-                entry, created = await _extract_one(xmp_store, file_info.path, force_extract_exif)
-                photo_entries.append(entry)
-                if created:
-                    result.sidecars_created += 1
-                else:
-                    result.sidecars_skipped += 1
-            except Exception as exc:
-                _log.error(
-                    "Failed to process photo — partition=%r file=%r: %s",
-                    partition,
-                    filename,
-                    exc,
-                    exc_info=True,
-                )
-                result.errors += 1
-                result.error_details.append(f"{filename}: {exc}")
-        else:
-            photo_entries.append(existing_by_filename[filename])
-            result.photos_skipped += 1
+                existing_manifest, existing_version = await manifest_store.read_leaf(partition)
+                existing_by_filename = {e.filename: e for e in existing_manifest.photos}
+                # Count and log photos that have been deleted from disk since the last index.
+                deleted_filenames = existing_by_filename.keys() - disk_filenames
+                result.photos_deleted = len(deleted_filenames)
+                if deleted_filenames:
+                    _log.info(
+                        "Incremental index — %d photo(s) removed from disk since last index"
+                        " — partition=%r: %s",
+                        len(deleted_filenames),
+                        partition,
+                        ", ".join(sorted(deleted_filenames)),
+                    )
+            except FileNotFoundError:
+                pass  # First run — no manifest yet, treat all photos as new.
 
-    # Collect new entries for thumbnail purposes (photos not previously in manifest).
-    new_entries = [e for e in photo_entries if e.filename not in existing_by_filename]
+        photo_entries: list[PhotoEntry] = []
 
-    # Generate thumbnail AVIF container.
-    # Full mode: regenerate for all photos (replaces existing chunks).
-    # Incremental mode: generate only for new photos and append to existing chunks.
-    thumbnail_chunks_to_write: list[ThumbnailChunk] | None = None
-    if generate_thumbnails:
-        if force_full_index:
-            if photo_entries:
+        for file_info in photo_files:
+            filename = PurePath(file_info.path).name
+            if force_full_index or filename not in existing_by_filename:
+                result.photos_processed += 1
+                try:
+                    entry, created = await _extract_one(
+                        xmp_store, file_info.path, force_extract_exif
+                    )
+                    photo_entries.append(entry)
+                    if created:
+                        result.sidecars_created += 1
+                    else:
+                        result.sidecars_skipped += 1
+                except Exception as exc:
+                    _log.error(
+                        "Failed to process photo — partition=%r file=%r: %s",
+                        partition,
+                        filename,
+                        exc,
+                        exc_info=True,
+                    )
+                    result.errors += 1
+                    result.error_details.append(f"{filename}: {exc}")
+            else:
+                photo_entries.append(existing_by_filename[filename])
+                result.photos_skipped += 1
+
+        # Collect new entries for thumbnail purposes (photos not previously in manifest).
+        new_entries = [e for e in photo_entries if e.filename not in existing_by_filename]
+
+        # Generate thumbnail AVIF container.
+        # Thumbnails are content-addressed (write_new), so no lock conflict.
+        # Full mode: regenerate for all photos (replaces existing chunks).
+        # Incremental mode: generate only for new photos and append to existing chunks.
+        thumbnail_chunks_to_write: list[ThumbnailChunk] | None = None
+        if generate_thumbnails:
+            if force_full_index:
+                if photo_entries:
+                    try:
+                        from ouestcharlie_toolkit.thumbnail_builder import (
+                            generate_partition_thumbnails,
+                        )
+
+                        thumbnail_chunks_to_write = await generate_partition_thumbnails(
+                            backend, partition, photo_entries, tier="thumbnail"
+                        )
+                        result.thumbnails_rebuilt = True
+                    except Exception as exc:
+                        _log.error(
+                            "Thumbnail generation failed — partition=%r: %s",
+                            partition,
+                            exc,
+                            exc_info=True,
+                        )
+                        result.errors += 1
+                        result.error_details.append(f"thumbnails: {exc}")
+            elif new_entries:
+                # Incremental: thumbnail only new photos, then append chunk to existing ones.
                 try:
                     from ouestcharlie_toolkit.thumbnail_builder import (
                         generate_partition_thumbnails,
                     )
 
-                    thumbnail_chunks_to_write = await generate_partition_thumbnails(
-                        backend, partition, photo_entries, tier="thumbnail"
+                    new_chunks = await generate_partition_thumbnails(
+                        backend, partition, new_entries, tier="thumbnail"
                     )
+                    existing_chunks = (
+                        existing_manifest.thumbnail_chunks if existing_manifest else []
+                    )
+                    thumbnail_chunks_to_write = existing_chunks + new_chunks
                     result.thumbnails_rebuilt = True
                 except Exception as exc:
                     _log.error(
@@ -236,42 +267,20 @@ async def index_partition(
                     )
                     result.errors += 1
                     result.error_details.append(f"thumbnails: {exc}")
-        elif new_entries:
-            # Incremental: thumbnail only new photos, then append chunk to existing ones.
-            try:
-                from ouestcharlie_toolkit.thumbnail_builder import (
-                    generate_partition_thumbnails,
-                )
+            # else: no new photos in incremental mode → pass None → preserve existing chunks
 
-                new_chunks = await generate_partition_thumbnails(
-                    backend, partition, new_entries, tier="thumbnail"
-                )
-                existing_chunks = existing_manifest.thumbnail_chunks if existing_manifest else []
-                thumbnail_chunks_to_write = existing_chunks + new_chunks
-                result.thumbnails_rebuilt = True
-            except Exception as exc:
-                _log.error(
-                    "Thumbnail generation failed — partition=%r: %s",
-                    partition,
-                    exc,
-                    exc_info=True,
-                )
-                result.errors += 1
-                result.error_details.append(f"thumbnails: {exc}")
-        # else: no new photos in incremental mode → pass None → preserve existing chunks
+        # Build or update the leaf manifest.
+        # Pass the already-read manifest and version token to avoid a second read_leaf call.
+        prefetched = (
+            (existing_manifest, existing_version)
+            if existing_manifest is not None and existing_version is not None
+            else None
+        )
+        summary = await _upsert_leaf_manifest(
+            manifest_store, partition, photo_entries, thumbnail_chunks_to_write, prefetched
+        )
 
-    # Build or update the leaf manifest.
-    # Pass the already-read manifest and version token to avoid a second read_leaf call.
-    prefetched = (
-        (existing_manifest, existing_version)
-        if existing_manifest is not None and existing_version is not None
-        else None
-    )
-    summary = await _upsert_leaf_manifest(
-        manifest_store, partition, photo_entries, thumbnail_chunks_to_write, prefetched
-    )
-
-    # Update the backend-wide summary.json with this partition's new summary.
+    # Update the backend-wide summary.json — separate root lock inside upsert.
     if summary is not None:
         try:
             await manifest_store.upsert_partition_in_summary(summary)
@@ -485,7 +494,8 @@ async def _prune_deleted_partitions(
         _extra=existing_summary._extra,
     )
     try:
-        await manifest_store.write_summary(pruned, version)
+        async with backend.partition_lock(""):
+            await manifest_store.write_summary(pruned, version)
     except Exception as exc:
         _log.error("Failed to prune summary.json: %s", exc, exc_info=True)
 
