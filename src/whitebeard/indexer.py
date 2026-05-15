@@ -10,12 +10,12 @@ from dataclasses import dataclass, field
 from itertools import chain
 from pathlib import PurePath
 
-from ouestcharlie_toolkit.backend import Backend, VersionToken
+from ouestcharlie_toolkit.backend import Backend
+from ouestcharlie_toolkit.lance_index import PHOTO_TABLE_NAME, LanceIndex, row_to_photo_entry
 from ouestcharlie_toolkit.manifest import ManifestStore
 from ouestcharlie_toolkit.schema import (
     METADATA_DIR,
     SCHEMA_VERSION,
-    LeafManifest,
     ManifestSummary,
     PhotoEntry,
     RootSummary,
@@ -157,6 +157,7 @@ async def index_partition(
     result = IndexResult(partition=partition)
     xmp_store = XmpStore(backend)
     manifest_store = ManifestStore(backend)
+    lance_index = await LanceIndex.open_or_create(backend, PHOTO_TABLE_NAME)
 
     # List only direct-child photo files — read-only, no lock needed.
     photo_files = await backend.list_files(partition, PHOTO_EXTENSIONS)
@@ -166,28 +167,23 @@ async def index_partition(
     # that no other agent can interleave writes on the same partition.
     summary = None
     async with backend.partition_lock(partition):
-        # In incremental mode, load the existing manifest inside the lock so
-        # the version token remains valid for the subsequent write_leaf call.
+        # In incremental mode, load existing photo entries from LanceDB.
         existing_by_filename: dict[str, PhotoEntry] = {}
-        existing_manifest: LeafManifest | None = None
-        existing_version: VersionToken | None = None
         if not force_full_index:
-            try:
-                existing_manifest, existing_version = await manifest_store.read_leaf(partition)
-                existing_by_filename = {e.filename: e for e in existing_manifest.photos}
-                # Count and log photos that have been deleted from disk since the last index.
-                deleted_filenames = existing_by_filename.keys() - disk_filenames
-                result.photos_deleted = len(deleted_filenames)
-                if deleted_filenames:
-                    _log.info(
-                        "Incremental index — %d photo(s) removed from disk since last index"
-                        " — partition=%r: %s",
-                        len(deleted_filenames),
-                        partition,
-                        ", ".join(sorted(deleted_filenames)),
-                    )
-            except FileNotFoundError:
-                pass  # First run — no manifest yet, treat all photos as new.
+            existing_rows = await lance_index.get_partition_rows(partition)
+            existing_by_filename = {
+                row["filename"]: row_to_photo_entry(row) for row in existing_rows
+            }
+            deleted_filenames = existing_by_filename.keys() - disk_filenames
+            result.photos_deleted = len(deleted_filenames)
+            if deleted_filenames:
+                _log.info(
+                    "Incremental index — %d photo(s) removed from disk since last index"
+                    " — partition=%r: %s",
+                    len(deleted_filenames),
+                    partition,
+                    ", ".join(sorted(deleted_filenames)),
+                )
 
         photo_entries: list[PhotoEntry] = []
 
@@ -218,23 +214,25 @@ async def index_partition(
                 photo_entries.append(existing_by_filename[filename])
                 result.photos_skipped += 1
 
-        # Collect new entries for thumbnail purposes (photos not previously in manifest).
+        # Collect new entries for thumbnail purposes (photos not previously in the index).
         new_entries = [e for e in photo_entries if e.filename not in existing_by_filename]
 
         # Generate thumbnail AVIF container.
         # Thumbnails are content-addressed (write_new), so no lock conflict.
-        # Full mode: regenerate for all photos (replaces existing chunks).
-        # Incremental mode: generate only for new photos and append to existing chunks.
-        thumbnail_chunks_to_write: list[ThumbnailChunk] | None = None
+        # Full mode: regenerate for all photos.
+        # Incremental mode: generate only for new photos; existing thumbnail data is
+        # preserved per-photo inside lance_index.upsert_partition.
+        thumbnail_lookup: dict[str, tuple[str, int]] = {}
         if generate_thumbnails:
             if force_full_index:
                 await delete_partition_thumbnails(backend, partition)
                 if photo_entries:
                     try:
-                        thumbnail_chunks_to_write = await generate_partition_thumbnails(
+                        new_chunks = await generate_partition_thumbnails(
                             backend, partition, photo_entries, tier="thumbnail"
                         )
                         result.thumbnails_rebuilt = True
+                        thumbnail_lookup = _chunks_to_lookup(new_chunks)
                     except Exception as exc:
                         _log.error(
                             "Thumbnail generation failed — partition=%r: %s",
@@ -245,16 +243,12 @@ async def index_partition(
                         result.errors += 1
                         result.error_details.append(f"thumbnails: {exc}")
             elif new_entries:
-                # Incremental: thumbnail only new photos, then append chunk to existing ones.
                 try:
                     new_chunks = await generate_partition_thumbnails(
                         backend, partition, new_entries, tier="thumbnail"
                     )
-                    existing_chunks = (
-                        existing_manifest.thumbnail_chunks if existing_manifest else []
-                    )
-                    thumbnail_chunks_to_write = existing_chunks + new_chunks
                     result.thumbnails_rebuilt = True
+                    thumbnail_lookup = _chunks_to_lookup(new_chunks)
                 except Exception as exc:
                     _log.error(
                         "Thumbnail generation failed — partition=%r: %s",
@@ -264,18 +258,16 @@ async def index_partition(
                     )
                     result.errors += 1
                     result.error_details.append(f"thumbnails: {exc}")
-            # else: no new photos in incremental mode → pass None → preserve existing chunks
 
-        # Build or update the leaf manifest.
-        # Pass the already-read manifest and version token to avoid a second read_leaf call.
-        prefetched = (
-            (existing_manifest, existing_version)
-            if existing_manifest is not None and existing_version is not None
-            else None
-        )
-        summary = await _upsert_leaf_manifest(
-            manifest_store, partition, photo_entries, thumbnail_chunks_to_write, prefetched
-        )
+        # Upsert all photo rows for this partition.
+        await lance_index.upsert_partition(partition, photo_entries, thumbnail_lookup or None)
+
+        # Delete photos removed from disk.
+        if result.photos_deleted:
+            deleted_hashes = [existing_by_filename[fn].content_hash for fn in deleted_filenames]
+            await lance_index.delete_photos(deleted_hashes)
+
+        summary = ManifestSummary.from_photos(partition, photo_entries)
 
     # Update the backend-wide summary.json — separate root lock inside upsert.
     if summary is not None:
@@ -387,8 +379,9 @@ async def index_library(
 
     # Remove stale partitions (in summary.json but no longer on disk).
     indexed_paths = {r.partition for r in library_result.partitions}
+    lance_index = await LanceIndex.open_or_create(backend, PHOTO_TABLE_NAME)
     library_result.partitions_deleted = await _prune_deleted_partitions(
-        backend, manifest_store, indexed_paths
+        backend, manifest_store, lance_index, indexed_paths
     )
 
     library_result.total_duration_ms = round((time.monotonic() - _t0) * 1000)
@@ -420,48 +413,13 @@ async def _extract_one(
     return entry, created
 
 
-async def _upsert_leaf_manifest(
-    manifest_store: ManifestStore,
-    partition: str,
-    photo_entries: list[PhotoEntry],
-    thumbnail_chunks: list[ThumbnailChunk] | None = None,
-    prefetched: tuple[LeafManifest, VersionToken] | None = None,
-) -> ManifestSummary:
-    """Create or update the leaf manifest for the partition.
-
-    Args:
-        thumbnail_chunks: List of chunks from ``generate_partition_thumbnails``,
-            or ``None`` to preserve the existing value.  In incremental mode
-            the caller pre-merges existing + new chunks before passing here.
-        prefetched: Already-read ``(LeafManifest, VersionToken)`` from an earlier
-            ``read_leaf`` call.  When provided, the read is skipped and the
-            supplied version token is used for the write.
-
-    Returns:
-        The ManifestSummary written into the Root Summary.
-    """
-    summary = ManifestSummary.from_photos(partition, photo_entries)
-    manifest = LeafManifest(
-        schema_version=SCHEMA_VERSION,
-        partition=partition,
-        photos=photo_entries,
-    )
-    try:
-        if prefetched is not None:
-            existing, version = prefetched
-        else:
-            existing, version = await manifest_store.read_leaf(partition)
-        manifest._extra = existing._extra  # preserve unknown fields
-        if thumbnail_chunks is not None:
-            manifest.thumbnail_chunks = thumbnail_chunks
-        else:
-            manifest.thumbnail_chunks = existing.thumbnail_chunks
-        await manifest_store.write_leaf(manifest, version)
-    except FileNotFoundError:
-        if thumbnail_chunks is not None:
-            manifest.thumbnail_chunks = thumbnail_chunks
-        await manifest_store.create_leaf(manifest)
-    return summary
+def _chunks_to_lookup(chunks: list[ThumbnailChunk]) -> dict[str, tuple[str, int]]:
+    """Convert ThumbnailChunk list to content_hash → (avif_hash, tile_index) map."""
+    lookup: dict[str, tuple[str, int]] = {}
+    for chunk in chunks:
+        for i, content_hash in enumerate(chunk.grid.photo_order):
+            lookup[content_hash] = (chunk.avif_hash, i)
+    return lookup
 
 
 # ---------------------------------------------------------------------------
@@ -472,9 +430,10 @@ async def _upsert_leaf_manifest(
 async def _prune_deleted_partitions(
     backend: Backend,
     manifest_store: ManifestStore,
+    lance_index: LanceIndex,
     indexed_paths: set[str],
 ) -> int:
-    """Remove stale partition entries from summary.json and their metadata dirs.
+    """Remove stale partition entries from summary.json, LanceDB, and metadata dirs.
 
     Called after ``index_library`` completes.  Compares the set of discovered
     partitions against the existing ``summary.json`` and removes any partition
@@ -500,6 +459,7 @@ async def _prune_deleted_partitions(
 
     for p in stale:
         await _delete_partition_metadata(backend, p.path)
+        await lance_index.delete_partition(p.path)
 
     pruned = RootSummary(
         schema_version=existing_summary.schema_version,

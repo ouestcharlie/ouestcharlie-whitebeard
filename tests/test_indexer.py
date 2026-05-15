@@ -11,8 +11,9 @@ from unittest.mock import patch
 
 import pytest
 from ouestcharlie_toolkit.backends.local import LocalBackend
-from ouestcharlie_toolkit.manifest import ManifestStore, ManifestSummary
-from ouestcharlie_toolkit.schema import METADATA_DIR, SCHEMA_VERSION, RootSummary
+from ouestcharlie_toolkit.lance_index import PHOTO_TABLE_NAME, LanceIndex
+from ouestcharlie_toolkit.manifest import ManifestStore
+from ouestcharlie_toolkit.schema import SCHEMA_VERSION, RootSummary
 from ouestcharlie_toolkit.xmp import parse_xmp
 
 from whitebeard.indexer import (
@@ -27,6 +28,11 @@ _SAMPLE_JPG = Path(__file__).parent / "sample-images" / "001.jpg"
 
 # Minimal valid JPEG (SOI + JFIF APP0 + EOI) — no EXIF data.
 _MINIMAL_JPEG = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00\xff\xd9"
+
+
+def _unique_jpeg(i: int) -> bytes:
+    """Unique minimal JPEG bytes so each file gets a distinct content hash."""
+    return _MINIMAL_JPEG + bytes([i % 256])
 
 
 # ---------------------------------------------------------------------------
@@ -88,59 +94,47 @@ async def test_index_sidecar_has_camera_fields(
 
 
 # ---------------------------------------------------------------------------
-# index_partition — leaf manifest
+# index_partition — LanceDB index
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_index_creates_leaf_manifest(backend_with_sample: LocalBackend, tmpdir: Path) -> None:
-    """index_partition writes the leaf manifest at .ouestcharlie/manifest.json."""
+async def test_index_manifest_photo_entry(backend_with_sample: LocalBackend) -> None:
+    """The LanceDB index contains a photo entry with the correct filename and hash."""
     await index_partition(backend_with_sample, "")
-    manifest_file = tmpdir / METADATA_DIR / "manifest.json"
-    assert manifest_file.exists()
+    lance_index = await LanceIndex.open(backend_with_sample, PHOTO_TABLE_NAME)
+    rows = await lance_index.get_partition_rows("")
+    assert len(rows) == 1
+    assert rows[0]["filename"] == "001.jpg"
+    assert len(rows[0]["content_hash"]) == 22
 
 
 @pytest.mark.asyncio
-async def test_index_manifest_photo_entry(backend_with_sample: LocalBackend, tmpdir: Path) -> None:
-    """The leaf manifest contains a photo entry with the correct filename and hash."""
+async def test_index_manifest_summary(backend_with_sample: LocalBackend) -> None:
+    """The root summary reflects the photo count after indexing."""
     await index_partition(backend_with_sample, "")
-    manifest_file = tmpdir / METADATA_DIR / "manifest.json"
-    data = json.loads(manifest_file.read_text(encoding="utf-8"))
-    assert len(data["photos"]) == 1
-    entry = data["photos"][0]
-    assert entry["filename"] == "001.jpg"
-    assert len(entry["contentHash"]) == 22
+    store = ManifestStore(backend_with_sample)
+    summary, _ = await store.read_summary()
+    partition = next(p for p in summary.partitions if p.path == "")
+    assert partition.photo_count == 1
 
 
 @pytest.mark.asyncio
-async def test_index_manifest_summary(backend_with_sample: LocalBackend, tmpdir: Path) -> None:
-    """The leaf manifest summary reflects the photo count."""
+async def test_index_manifest_has_date(backend_with_sample: LocalBackend) -> None:
+    """The partition summary has a date range when the photo has EXIF date."""
     await index_partition(backend_with_sample, "")
-
-    manifestStore = ManifestStore(backend_with_sample)
-    manifest, _ = await manifestStore.read_leaf("")
-    summary = ManifestSummary.from_photos("", manifest.photos)
-    assert summary.photo_count == 1
-
-
-@pytest.mark.asyncio
-async def test_index_manifest_has_date(backend_with_sample: LocalBackend, tmpdir: Path) -> None:
-    """The manifest summary has a date range when the photo has EXIF date."""
-    await index_partition(backend_with_sample, "")
-
-    manifestStore = ManifestStore(backend_with_sample)
-    manifest, _ = await manifestStore.read_leaf("")
-    summary = ManifestSummary.from_photos("", manifest.photos)
-
+    store = ManifestStore(backend_with_sample)
+    summary, _ = await store.read_summary()
+    partition = next(p for p in summary.partitions if p.path == "")
     # 001.jpg has EXIF DateTimeOriginal
-    assert "dateTaken" in summary._stats
-    assert "min" in summary._stats["dateTaken"]
-    assert "max" in summary._stats["dateTaken"]
+    assert "dateTaken" in partition._stats
+    assert "min" in partition._stats["dateTaken"]
+    assert "max" in partition._stats["dateTaken"]
 
 
 @pytest.mark.asyncio
 async def test_index_manifest_summary_rating_range(tmpdir: Path) -> None:
-    """Leaf manifest summary has ratingMin/ratingMax when photos have ratings."""
+    """Partition summary has rating min/max when photos have ratings."""
     from ouestcharlie_toolkit.schema import PhotoEntry, XmpSidecar
 
     (tmpdir / "a.jpg").write_bytes(_MINIMAL_JPEG)
@@ -164,26 +158,25 @@ async def test_index_manifest_summary_rating_range(tmpdir: Path) -> None:
     with patch("whitebeard.indexer._extract_one", side_effect=fake_process):
         await index_partition(backend, "")
 
-    manifestStore = ManifestStore(backend)
-    manifest, _ = await manifestStore.read_leaf("")
-    summary = ManifestSummary.from_photos("", manifest.photos)
-    assert summary._stats["rating"]["min"] == 2
-    assert summary._stats["rating"]["max"] == 5
+    store = ManifestStore(backend)
+    summary, _ = await store.read_summary()
+    partition = next(p for p in summary.partitions if p.path == "")
+    assert partition._stats["rating"]["min"] == 2
+    assert partition._stats["rating"]["max"] == 5
 
 
 @pytest.mark.asyncio
 async def test_index_manifest_summary_no_rating_when_unrated(tmpdir: Path) -> None:
-    """ratingMin/ratingMax are absent from the summary when no photo has a rating."""
+    """Rating stats are absent from the summary when no photo has a rating."""
     (tmpdir / "photo.jpg").write_bytes(_MINIMAL_JPEG)
     backend = LocalBackend(root=tmpdir)
 
     await index_partition(backend, "")
 
-    manifestStore = ManifestStore(backend)
-    manifest, _ = await manifestStore.read_leaf("")
-    summary = ManifestSummary.from_photos("", manifest.photos)
-
-    assert "rating" not in summary._stats
+    store = ManifestStore(backend)
+    summary, _ = await store.read_summary()
+    partition = next(p for p in summary.partitions if p.path == "")
+    assert "rating" not in partition._stats
 
 
 # ---------------------------------------------------------------------------
@@ -263,9 +256,10 @@ async def test_index_ignores_subdirectory_photos(tmpdir: Path) -> None:
     result = await index_partition(backend, "")
 
     assert result.photos_processed == 1  # only top.jpg
-    data = json.loads((tmpdir / METADATA_DIR / "manifest.json").read_text())
-    assert len(data["photos"]) == 1
-    assert data["photos"][0]["filename"] == "top.jpg"
+    lance_index = await LanceIndex.open(backend, PHOTO_TABLE_NAME)
+    rows = await lance_index.get_partition_rows("")
+    assert len(rows) == 1
+    assert rows[0]["filename"] == "top.jpg"
 
 
 @pytest.mark.asyncio
@@ -296,10 +290,9 @@ async def test_index_sub_partition(tmpdir: Path) -> None:
 
     assert result.photos_processed == 1
     assert result.sidecars_created == 1
-    manifest_file = tmpdir / METADATA_DIR / "Vacations" / "Italy" / "manifest.json"
-    assert manifest_file.exists()
-    data = json.loads(manifest_file.read_text())
-    assert data["partition"] == "Vacations/Italy"
+    store = ManifestStore(backend)
+    summary, _ = await store.read_summary()
+    assert any(p.path == "Vacations/Italy" for p in summary.partitions)
 
 
 # ---------------------------------------------------------------------------
@@ -309,7 +302,7 @@ async def test_index_sub_partition(tmpdir: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_index_library_single_partition(tmpdir: Path) -> None:
-    """index_library with photos only at root creates a leaf manifest, no parent."""
+    """index_library with photos only at root indexes exactly one partition."""
     (tmpdir / "photo.jpg").write_bytes(_MINIMAL_JPEG)
     backend = LocalBackend(root=tmpdir)
 
@@ -318,10 +311,6 @@ async def test_index_library_single_partition(tmpdir: Path) -> None:
     assert isinstance(result, LibraryIndexResult)
     assert len(result.partitions) == 1
     assert result.total_photos == 1
-    # Leaf manifest exists.
-    assert (tmpdir / METADATA_DIR / "manifest.json").exists()
-    # No parent manifest (nothing to summarise above a single leaf at root).
-    # The root IS the leaf, so no deeper parent manifest is needed.
 
 
 @pytest.mark.asyncio
@@ -345,8 +334,8 @@ async def test_index_partition_writes_summary_json(tmpdir: Path) -> None:
 async def test_index_partition_updates_existing_summary(tmpdir: Path) -> None:
     """Re-indexing a partition replaces its entry in summary.json."""
     (tmpdir / "A").mkdir()
-    (tmpdir / "A" / "p1.jpg").write_bytes(_MINIMAL_JPEG)
-    (tmpdir / "A" / "p2.jpg").write_bytes(_MINIMAL_JPEG)
+    (tmpdir / "A" / "p1.jpg").write_bytes(_unique_jpeg(0))
+    (tmpdir / "A" / "p2.jpg").write_bytes(_unique_jpeg(1))
     backend = LocalBackend(root=tmpdir)
 
     await index_partition(backend, "A")
@@ -369,32 +358,11 @@ async def test_index_library_writes_summary_json(tmpdir: Path) -> None:
     result = await index_library(backend)
 
     assert result.total_photos == 2
-    # All traversed directories get a manifest (including intermediate ones).
-    assert (tmpdir / METADATA_DIR / "2024" / "2024-07" / "manifest.json").exists()
-    assert (tmpdir / METADATA_DIR / "2024" / "2024-08" / "manifest.json").exists()
-    assert (tmpdir / METADATA_DIR / "2024" / "manifest.json").exists()
-    # summary.json lists all indexed partitions (photo-bearing and intermediate).
+    # summary.json lists all indexed partitions.
     data = json.loads((tmpdir / ".ouestcharlie" / "summary.json").read_text())
     paths = {p["path"] for p in data["partitions"]}
     assert "2024/2024-07" in paths
     assert "2024/2024-08" in paths
-
-
-@pytest.mark.asyncio
-async def test_index_library_all_dirs_get_manifest(tmpdir: Path) -> None:
-    """All traversed directories get a manifest, including intermediate ones."""
-    (tmpdir / "2024" / "July" / "Vacation").mkdir(parents=True)
-    shutil.copy(_SAMPLE_JPG, tmpdir / "2024" / "July" / "Vacation" / "001.jpg")
-    backend = LocalBackend(root=tmpdir)
-
-    await index_library(backend)
-
-    # Every directory in the tree gets a manifest.json.
-    assert (tmpdir / METADATA_DIR / "2024" / "July" / "Vacation" / "manifest.json").exists()
-    assert (tmpdir / METADATA_DIR / "2024" / "July" / "manifest.json").exists()
-    assert (tmpdir / METADATA_DIR / "2024" / "manifest.json").exists()
-    # summary.json exists at root.
-    assert (tmpdir / METADATA_DIR / "summary.json").exists()
 
 
 @pytest.mark.asyncio
@@ -738,7 +706,7 @@ async def test_incremental_skips_already_indexed_photos(tmpdir: Path) -> None:
 @pytest.mark.asyncio
 async def test_incremental_processes_new_photos_in_existing_partition(tmpdir: Path) -> None:
     """In incremental mode, only photos absent from the manifest are processed."""
-    (tmpdir / "existing.jpg").write_bytes(_MINIMAL_JPEG)
+    (tmpdir / "existing.jpg").write_bytes(_unique_jpeg(0))
     backend = LocalBackend(root=tmpdir)
 
     # First run: index existing.jpg.
@@ -746,7 +714,7 @@ async def test_incremental_processes_new_photos_in_existing_partition(tmpdir: Pa
     assert result1.photos_processed == 1
 
     # Add a new photo.
-    (tmpdir / "new.jpg").write_bytes(_MINIMAL_JPEG)
+    (tmpdir / "new.jpg").write_bytes(_unique_jpeg(1))
 
     result2 = await index_partition(backend, "")
 
@@ -755,10 +723,10 @@ async def test_incremental_processes_new_photos_in_existing_partition(tmpdir: Pa
     assert result2.photos_deleted == 0
     assert result2.errors == 0
 
-    # Both photos must appear in the manifest.
-    manifest_store = ManifestStore(backend)
-    manifest, _ = await manifest_store.read_leaf("")
-    filenames = {e.filename for e in manifest.photos}
+    # Both photos must appear in the index.
+    lance_index_obj = await LanceIndex.open(backend, PHOTO_TABLE_NAME)
+    rows = await lance_index_obj.get_partition_rows("")
+    filenames = {r["filename"] for r in rows}
     assert "existing.jpg" in filenames
     assert "new.jpg" in filenames
 
@@ -767,9 +735,9 @@ async def test_incremental_processes_new_photos_in_existing_partition(tmpdir: Pa
 async def test_incremental_removes_deleted_photos_from_manifest(
     tmpdir: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Photos deleted from disk are counted, logged, and removed from the manifest."""
-    (tmpdir / "keep.jpg").write_bytes(_MINIMAL_JPEG)
-    (tmpdir / "delete.jpg").write_bytes(_MINIMAL_JPEG)
+    """Photos deleted from disk are counted, logged, and removed from the index."""
+    (tmpdir / "keep.jpg").write_bytes(_unique_jpeg(0))
+    (tmpdir / "delete.jpg").write_bytes(_unique_jpeg(1))
     backend = LocalBackend(root=tmpdir)
 
     # First run: both photos indexed.
@@ -788,10 +756,10 @@ async def test_incremental_removes_deleted_photos_from_manifest(
     # "delete.jpg" must appear in the INFO log.
     assert any("delete.jpg" in record.message for record in caplog.records)
 
-    # Manifest must only contain keep.jpg.
-    manifest_store = ManifestStore(backend)
-    manifest, _ = await manifest_store.read_leaf("")
-    filenames = {e.filename for e in manifest.photos}
+    # Index must only contain keep.jpg.
+    lance_index_obj = await LanceIndex.open(backend, PHOTO_TABLE_NAME)
+    rows = await lance_index_obj.get_partition_rows("")
+    filenames = {r["filename"] for r in rows}
     assert "keep.jpg" in filenames
     assert "delete.jpg" not in filenames
 
@@ -883,12 +851,12 @@ async def test_incremental_generates_new_thumbnail_chunk_when_photo_added(
     tmpdir: Path,
 ) -> None:
     """In incremental mode, a new thumbnail chunk is generated for new photos only."""
-    (tmpdir / "existing.jpg").write_bytes(_MINIMAL_JPEG)
+    (tmpdir / "existing.jpg").write_bytes(_unique_jpeg(0))
     backend = LocalBackend(root=tmpdir)
 
     await index_partition(backend, "")  # first run
 
-    (tmpdir / "new.jpg").write_bytes(_MINIMAL_JPEG)  # add a new photo
+    (tmpdir / "new.jpg").write_bytes(_unique_jpeg(1))  # add a new photo
 
     thumbnail_call_args: list = []
 
@@ -969,8 +937,6 @@ async def test_index_library_does_not_touch_active_partitions(tmpdir: Path) -> N
     shutil.rmtree(tmpdir / "Gone")
     await index_library(backend)
 
-    # Keep partition's manifest must still exist.
-    assert (tmpdir / ".ouestcharlie" / "Keep" / "manifest.json").exists()
     summary_data = json.loads((tmpdir / ".ouestcharlie" / "summary.json").read_text())
     paths = {p["path"] for p in summary_data["partitions"]}
     assert "Keep" in paths
