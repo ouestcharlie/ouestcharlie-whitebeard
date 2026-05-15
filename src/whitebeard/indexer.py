@@ -115,6 +115,7 @@ async def index_partition(
     force_extract_exif: bool = False,
     generate_thumbnails: bool = False,
     force_full_index: bool = False,
+    lance_index: LanceIndex | None = None,
 ) -> IndexResult:
     """Index all photos in a partition (index mode — files stay in place).
 
@@ -151,6 +152,11 @@ async def index_partition(
         force_full_index: If True, re-process all photos regardless of the
             existing manifest.  If False (default), photos already present in
             the manifest are carried over without calling ``_extract_one``.
+        lance_index: Pre-opened LanceIndex to reuse.  When called from
+            ``index_library`` this is the shared instance created once before
+            any concurrent tasks run, preventing concurrent ``create_table``
+            calls that cause Lance MVCC conflicts.  Pass ``None`` (default)
+            when calling ``index_partition`` directly; it will open its own.
 
     Returns:
         IndexResult with counts of processed, skipped, deleted, created, and
@@ -160,7 +166,8 @@ async def index_partition(
     result = IndexResult(partition=partition)
     xmp_store = XmpStore(backend)
     manifest_store = ManifestStore(backend)
-    lance_index = await LanceIndex.open_or_create(backend, PHOTO_TABLE_NAME)
+    if lance_index is None:
+        lance_index = await LanceIndex.open_or_create(backend, PHOTO_TABLE_NAME)
 
     # List only direct-child photo files — read-only, no lock needed.
     photo_files = await backend.list_files(partition, PHOTO_EXTENSIONS)
@@ -349,6 +356,12 @@ async def index_library(
             if not PurePath(subdir).name.startswith("."):
                 queue.append(subdir)
 
+    # Create the LanceDB index once before spawning concurrent tasks.  Each
+    # concurrent call to index_partition would otherwise call create_table()
+    # independently; on Lance 4.x that races an Overwrite transaction against
+    # in-flight Update (merge_insert) transactions and raises an MVCC conflict.
+    lance_index = await LanceIndex.open_or_create(backend, PHOTO_TABLE_NAME)
+
     # Index partitions in parallel, capped at _MAX_CONCURRENT_PARTITIONS workers.
     # Thumbnail generation is already multi-threaded internally, so a low cap
     # avoids over-saturating I/O while still hiding per-partition latency.
@@ -365,6 +378,7 @@ async def index_library(
                 force_extract_exif,
                 generate_thumbnails=generate_thumbnails,
                 force_full_index=force_full_index,
+                lance_index=lance_index,
             )
         completed += 1
         if on_progress is not None:
@@ -382,7 +396,6 @@ async def index_library(
 
     # Remove stale partitions (in summary.json but no longer on disk).
     indexed_paths = {r.partition for r in library_result.partitions}
-    lance_index = await LanceIndex.open_or_create(backend, PHOTO_TABLE_NAME)
     library_result.partitions_deleted = await _prune_deleted_partitions(
         backend, manifest_store, lance_index, indexed_paths
     )
