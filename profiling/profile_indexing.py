@@ -23,13 +23,16 @@ from pathlib import Path, PurePath
 
 from dotenv import dotenv_values
 from ouestcharlie_toolkit.backends.local import LocalBackend
+from ouestcharlie_toolkit.lance_index import PHOTO_TABLE_NAME, LanceIndex
 from ouestcharlie_toolkit.manifest import ManifestStore
+from ouestcharlie_toolkit.partition_summary import compute_partition_summary
+from ouestcharlie_toolkit.thumbnail_builder import generate_partition_thumbnails
 from ouestcharlie_toolkit.xmp import XmpStore
 
 from whitebeard.indexer import (
     PHOTO_EXTENSIONS,
+    _chunks_to_lookup,
     _extract_one,
-    _upsert_leaf_manifest,
 )
 
 
@@ -82,7 +85,7 @@ class TimingBackend:
         with self._t("write_conditional"):
             return await self._inner.write_conditional(path, data, expected_version)
 
-    # Pass through any attributes not intercepted (e.g. root path)
+    # Pass through any attributes not intercepted (e.g. root path, partition_lock)
     def __getattr__(self, name):
         return getattr(self._inner, name)
 
@@ -103,6 +106,7 @@ async def profile_steps(backend_root: str, partition: str) -> None:
     backend = TimingBackend(inner)
     xmp_store = XmpStore(backend)
     manifest_store = ManifestStore(backend)
+    lance_index = await LanceIndex.open_or_create(backend, PHOTO_TABLE_NAME)
 
     # ── Step 1: Discovery ────────────────────────────────────────────────────
     t0 = time.perf_counter()
@@ -138,39 +142,41 @@ async def profile_steps(backend_root: str, partition: str) -> None:
     print(backend.report())
 
     # ── Step 3: Thumbnail generation ─────────────────────────────────────────
-    from ouestcharlie_toolkit.thumbnail_builder import generate_partition_thumbnails
-
     backend.totals.clear()
     backend.counts.clear()
     t0 = time.perf_counter()
-    thumbnail_result = await generate_partition_thumbnails(
+    chunks = await generate_partition_thumbnails(
         backend, partition, photo_entries, tier="thumbnail"
     )
     t_thumbnails = time.perf_counter() - t0
-    print(f"Thumbnails: {t_thumbnails * 1000:6.1f} ms")
+    thumbnail_lookup = _chunks_to_lookup(chunks)
+    print(f"Thumbnails: {t_thumbnails * 1000:6.1f} ms  ({len(chunks)} chunk(s))")
     print(backend.report())
 
-    # ── Step 4: Manifest write ────────────────────────────────────────────────
-    backend.totals.clear()
-    backend.counts.clear()
+    # ── Step 4: LanceDB upsert ────────────────────────────────────────────────
     t0 = time.perf_counter()
-    summary = await _upsert_leaf_manifest(
-        manifest_store, partition, photo_entries, thumbnail_result
-    )
-    t_manifest = time.perf_counter() - t0
-    print(f"Manifest:   {t_manifest * 1000:6.1f} ms")
-    print(backend.report())
+    await lance_index.upsert_partition(partition, photo_entries, thumbnail_lookup or None)
+    t_lance = time.perf_counter() - t0
+    print(f"LanceDB:    {t_lance * 1000:6.1f} ms  ({len(photo_entries)} rows upserted)")
 
-    # ── Step 5: Summary.json update ──────────────────────────────────────────
+    # ── Step 5: Partition summary (DuckDB over LanceDB) ──────────────────────
+    t0 = time.perf_counter()
+    summary = await compute_partition_summary(lance_index, partition)
+    t_summary_compute = time.perf_counter() - t0
+    print(f"Summary:    {t_summary_compute * 1000:6.1f} ms  (DuckDB aggregate)")
+
+    # ── Step 6: Summary.json write ───────────────────────────────────────────
     backend.totals.clear()
     backend.counts.clear()
     t0 = time.perf_counter()
     await manifest_store.upsert_partition_in_summary(summary)
-    t_summary = time.perf_counter() - t0
-    print(f"Summary:    {t_summary * 1000:6.1f} ms")
+    t_summary_write = time.perf_counter() - t0
+    print(f"Summary.json:{t_summary_write * 1000:6.1f} ms")
     print(backend.report())
 
-    total = t_discovery + t_exif_total + t_thumbnails + t_manifest + t_summary
+    total = (
+        t_discovery + t_exif_total + t_thumbnails + t_lance + t_summary_compute + t_summary_write
+    )
     print(f"\nTotal:      {total * 1000:6.1f} ms")
 
 
