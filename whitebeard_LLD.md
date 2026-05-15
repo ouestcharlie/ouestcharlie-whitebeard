@@ -22,13 +22,14 @@ src/whitebeard/
 Indexes all photos directly in one folder (direct children only — subdirectories are separate partitions).
 
 **Steps:**
-1. Fetch existing LanceDB rows for the partition to build `existing_by_filename` for incremental mode.
-2. List photo files in `partition` via `backend.list_files(partition, PHOTO_EXTENSIONS)`.
-3. Detect photos present in the LanceDB rows but no longer on disk — log them and schedule for deletion.
-4. For each photo: if already indexed and `force_full_index=False`, reuse the existing `PhotoEntry` (incremental). Otherwise read or create XMP sidecar (`XmpStore.read_or_create_from_picture`). If `force_extract_exif=True`, re-extract and overwrite.
-5. If `generate_thumbnails=True` and there are new photos, call `generate_partition_thumbnails` with only the newly-processed photos (or all photos when `force_full_index=True`). This is multi-threaded internally.
-6. Delete stale photos from the index, then upsert all current entries (with a thumbnail lookup for newly-generated chunks).
-7. Atomically update the backend-wide `summary.json`
+1. Fetch existing LanceDB rows for the partition (`filename` + `content_hash` only) to build the incremental skip map.
+2. List photo files on disk via `backend.list_files`.
+3. Detect photos in the index but no longer on disk — log and schedule for deletion.
+4. For each photo: if already indexed and `force_full_index=False`, skip (incremental). Otherwise read or create XMP sidecar. If `force_extract_exif=True`, re-extract and overwrite.
+5. If `generate_thumbnails=True` and there are new photos, generate AVIF chunks for newly-processed photos only (or all when `force_full_index=True`).
+6. Delete stale rows from the index; write all current entries via `LanceIndex.upsert_partition` (preserving existing thumbnail data for unchanged photos).
+7. Compute `ManifestSummary` via `compute_partition_summary` — a DuckDB aggregate query over the LanceDB index.
+8. Write the summary to the backend-wide `summary.json` via `ManifestStore.upsert_partition_in_summary`.
 
 **Returns:** `IndexResult` (photos processed, skipped, deleted, sidecars created/skipped, errors, duration).
 
@@ -74,36 +75,11 @@ Each `index_partition` call is independent: it upserts its rows into the shared 
 
 `LibraryIndexResult.partitions` preserves the BFS discovery order (same order as the input `partitions` list), because `asyncio.gather` returns results in submission order.
 
-## Incremental Indexing (Detail)
+## LanceDB Write
 
-By default both `index_partition` and `index_library` run in **incremental mode** (`force_full_index=False`).
+`LanceIndex.upsert_partition` receives the final `list[PhotoEntry]` and a `thumbnail_lookup` for newly-generated chunks. It pre-queries existing thumbnail data so that photos absent from the lookup retain their existing AVIF reference — preventing incremental runs from wiping thumbnails. Rows are merged on `content_hash` (update if matched, insert if not). Stale photo deletion is handled separately by the caller before this step.
 
-At the start of each `index_partition` call, existing LanceDB rows for the partition are fetched and a `filename → PhotoEntry` dict is built. For each photo file found on disk:
-
-- **Already indexed** → the existing `PhotoEntry` is reused without calling `_extract_one`. No sidecar I/O, no EXIF read. Counted in `IndexResult.photos_skipped`.
-- **Not indexed** → `_extract_one` is called as usual. Counted in `IndexResult.photos_processed`.
-- **Indexed but not on disk** → removed. Counted in `IndexResult.photos_deleted` and logged at INFO level.
-
-The first run against a partition with no existing index rows behaves identically to `force_full_index=True` — all photos are processed.
-
-**Thumbnail strategy in incremental mode:** only new photos are passed to `generate_partition_thumbnails`. The resulting new AVIF chunk is recorded in `thumbnail_lookup` and passed to `LanceIndex.upsert_partition`, which merges it with existing thumbnail data. Existing AVIF files are immutable (content-addressed) and are never modified or deleted. If no new photos are present, thumbnails are not regenerated.
-
-**`force_full_index=True`** skips the LanceDB pre-fetch, re-processes every photo, and regenerates thumbnails for the full photo set.
-
-**`force_full_index` and `force_extract_exif` are orthogonal.**  Using `force_extract_exif=True` alone does not trigger re-indexing of already-manifest photos in incremental mode — the photo is carried over as-is.  To regenerate both the manifest entry and the XMP sidecar, use both flags together.
-
-**Known limitation:** changes to a photo's EXIF data or XMP sidecar after the initial index are **not detected** in incremental mode.  The photo is already in the manifest and is carried over without re-reading its metadata.  Use `force_full_index=True` (and optionally `force_extract_exif=True`) to pick up metadata changes.
-
-## LanceDB Write (`LanceIndex.upsert_partition`)
-
-Called by `index_partition` after processing all photos for a partition:
-
-- Receives the final `list[PhotoEntry]` and a `thumbnail_lookup: dict[content_hash → (avif_hash, tile_index)]` for photos with newly generated thumbnails.
-- Pre-queries the table for existing thumbnail data for the partition. Photos absent from `thumbnail_lookup` retain their existing `thumbnail_avif_hash` / `thumbnail_tile_index` columns — preventing incremental runs from wiping thumbnails.
-- Builds a PyArrow table from the photo list and executes a `merge_insert` on `content_hash`: matched rows are updated in full, unmatched rows are inserted.
-- Is not responsible for deleting stale photos.
-
-`ManifestSummary.from_photos()` is still called to compute partition-level stats (date range, GPS bbox, photo count) that are written to `summary.json` via `ManifestStore.upsert_partition_in_summary`.
+After the upsert, `compute_partition_summary` runs aggregates query over the index to produce the `ManifestSummary` (photo count, date range, GPS bbox, rating range), which is then written to `summary.json`.
 
 ## XMP Sidecar Handling
 
