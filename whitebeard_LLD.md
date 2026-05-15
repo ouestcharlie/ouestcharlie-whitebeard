@@ -27,8 +27,8 @@ Indexes all photos directly in one folder (direct children only — subdirectori
 3. Detect photos present in the LanceDB rows but no longer on disk — log them and schedule for deletion.
 4. For each photo: if already indexed and `force_full_index=False`, reuse the existing `PhotoEntry` (incremental). Otherwise read or create XMP sidecar (`XmpStore.read_or_create_from_picture`). If `force_extract_exif=True`, re-extract and overwrite.
 5. If `generate_thumbnails=True` and there are new photos, call `generate_partition_thumbnails` with only the newly-processed photos (or all photos when `force_full_index=True`). This is multi-threaded internally.
-6. Delete stale photos from the index via `LanceIndex.delete_photos`, then upsert all current entries via `LanceIndex.upsert_partition` (with a thumbnail lookup for newly-generated chunks).
-7. Atomically update the backend-wide `summary.json` via `ManifestStore.upsert_partition_in_summary`.
+6. Delete stale photos from the index, then upsert all current entries (with a thumbnail lookup for newly-generated chunks).
+7. Atomically update the backend-wide `summary.json`
 
 **Returns:** `IndexResult` (photos processed, skipped, deleted, sidecars created/skipped, errors, duration).
 
@@ -48,8 +48,8 @@ Indexes the entire library under the backend root.
 
 Whitebeard defaults to incremental mode — photos already present in the LanceDB index are skipped without re-reading their XMP sidecars or re-extracting EXIF. Only new photos (filenames not in the index) are processed.
 
-- **Deleted photos**: photos in the LanceDB index but not on disk are deleted via `LanceIndex.delete_photos` and logged at INFO level.
-- **Deleted partitions**: partitions in `summary.json` but no longer on disk are removed from the summary, their LanceDB rows deleted via `LanceIndex.delete_partition`, and their `.ouestcharlie/<partition>/` directories deleted after the gather step in `index_library`.
+- **Deleted photos**: photos in the LanceDB index but not on disk are deleted and logged at INFO level.
+- **Deleted partitions**: partitions in `summary.json` but no longer on disk are removed from the summary, their LanceDB rows deleted, and their `.ouestcharlie/<partition>/` directories deleted after the gather step in `index_library`.
 - **EXIF changes**: changes to EXIF fields in an already-indexed photo are NOT detected in incremental mode. Use `force_extract_exif=True` together with `force_full_index=True` to refresh all metadata.
 - **Thumbnail strategy**: new AVIF chunks are generated only for newly-processed photos. `LanceIndex.upsert_partition` preserves existing thumbnail data for photos not included in the new thumbnail generation pass. `force_full_index=True` re-generates all thumbnail chunks for the partition.
 
@@ -82,7 +82,7 @@ At the start of each `index_partition` call, existing LanceDB rows for the parti
 
 - **Already indexed** → the existing `PhotoEntry` is reused without calling `_extract_one`. No sidecar I/O, no EXIF read. Counted in `IndexResult.photos_skipped`.
 - **Not indexed** → `_extract_one` is called as usual. Counted in `IndexResult.photos_processed`.
-- **Indexed but not on disk** → removed via `LanceIndex.delete_photos`. Counted in `IndexResult.photos_deleted` and logged at INFO level.
+- **Indexed but not on disk** → removed. Counted in `IndexResult.photos_deleted` and logged at INFO level.
 
 The first run against a partition with no existing index rows behaves identically to `force_full_index=True` — all photos are processed.
 
@@ -101,7 +101,7 @@ Called by `index_partition` after processing all photos for a partition:
 - Receives the final `list[PhotoEntry]` and a `thumbnail_lookup: dict[content_hash → (avif_hash, tile_index)]` for photos with newly generated thumbnails.
 - Pre-queries the table for existing thumbnail data for the partition. Photos absent from `thumbnail_lookup` retain their existing `thumbnail_avif_hash` / `thumbnail_tile_index` columns — preventing incremental runs from wiping thumbnails.
 - Builds a PyArrow table from the photo list and executes a `merge_insert` on `content_hash`: matched rows are updated in full, unmatched rows are inserted.
-- Is not responsible for deleting stale photos — `index_partition` calls `LanceIndex.delete_photos` separately for photos detected as deleted.
+- Is not responsible for deleting stale photos.
 
 `ManifestSummary.from_photos()` is still called to compute partition-level stats (date range, GPS bbox, photo count) that are written to `summary.json` via `ManifestStore.upsert_partition_in_summary`.
 

@@ -11,12 +11,15 @@ from itertools import chain
 from pathlib import PurePath
 
 from ouestcharlie_toolkit.backend import Backend
-from ouestcharlie_toolkit.lance_index import PHOTO_TABLE_NAME, LanceIndex, row_to_photo_entry
+from ouestcharlie_toolkit.lance_index import (
+    PHOTO_TABLE_NAME,
+    LanceIndex,
+)
 from ouestcharlie_toolkit.manifest import ManifestStore
+from ouestcharlie_toolkit.partition_summary import compute_partition_summary
 from ouestcharlie_toolkit.schema import (
     METADATA_DIR,
     SCHEMA_VERSION,
-    ManifestSummary,
     PhotoEntry,
     RootSummary,
     ThumbnailChunk,
@@ -168,12 +171,13 @@ async def index_partition(
     summary = None
     async with backend.partition_lock(partition):
         # In incremental mode, load existing photo entries from LanceDB.
-        existing_by_filename: dict[str, PhotoEntry] = {}
+        existing_by_filename: dict[str, str] = {}
+        deleted_filenames: set[str] | None = None
         if not force_full_index:
-            existing_rows = await lance_index.get_partition_rows(partition)
-            existing_by_filename = {
-                row["filename"]: row_to_photo_entry(row) for row in existing_rows
-            }
+            existing_rows = await lance_index.get_partition_rows(
+                partition, columns=["filename", "content_hash"]
+            )
+            existing_by_filename = {row["filename"]: row["content_hash"] for row in existing_rows}
             deleted_filenames = existing_by_filename.keys() - disk_filenames
             result.photos_deleted = len(deleted_filenames)
             if deleted_filenames:
@@ -211,7 +215,6 @@ async def index_partition(
                     result.errors += 1
                     result.error_details.append(f"{filename}: {exc}")
             else:
-                photo_entries.append(existing_by_filename[filename])
                 result.photos_skipped += 1
 
         # Collect new entries for thumbnail purposes (photos not previously in the index).
@@ -263,11 +266,11 @@ async def index_partition(
         await lance_index.upsert_partition(partition, photo_entries, thumbnail_lookup or None)
 
         # Delete photos removed from disk.
-        if result.photos_deleted:
-            deleted_hashes = [existing_by_filename[fn].content_hash for fn in deleted_filenames]
-            await lance_index.delete_photos(deleted_hashes)
+        if deleted_filenames:
+            deleted_hashes = [existing_by_filename[fn] for fn in deleted_filenames]
+            await lance_index.delete(partition, deleted_hashes)
 
-        summary = ManifestSummary.from_photos(partition, photo_entries)
+        summary = await compute_partition_summary(lance_index, partition)
 
     # Update the backend-wide summary.json — separate root lock inside upsert.
     if summary is not None:

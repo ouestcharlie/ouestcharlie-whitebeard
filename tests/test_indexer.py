@@ -339,7 +339,9 @@ async def test_index_partition_updates_existing_summary(tmpdir: Path) -> None:
     backend = LocalBackend(root=tmpdir)
 
     await index_partition(backend, "A")
-    await index_partition(backend, "A")  # second run — should not duplicate
+
+    # second run — should not duplicate
+    await index_partition(backend, "A")
 
     data = json.loads((tmpdir / ".ouestcharlie" / "summary.json").read_text())
     assert len(data["partitions"]) == 1
