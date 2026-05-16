@@ -36,6 +36,9 @@ _log = logging.getLogger(__name__)
 # generation is already multi-threaded internally.
 _MAX_CONCURRENT_PARTITIONS = 4
 
+# Maximum number of errors to report
+_TOP_ERRORS = 10
+
 # Photo file extensions indexed by Whitebeard (case-insensitive).
 PHOTO_EXTENSIONS: frozenset[str] = frozenset(
     {
@@ -81,7 +84,7 @@ class LibraryIndexResult:
     partitions_deleted: int = 0  # stale partitions removed from summary.json
 
     @property
-    def total_photos(self) -> int:
+    def total_photos_processed(self) -> int:
         return sum(r.photos_processed for r in self.partitions)
 
     @property
@@ -105,8 +108,8 @@ class LibraryIndexResult:
         return sum(1 for r in self.partitions if r.thumbnails_rebuilt)
 
     @property
-    def error_details(self) -> Generator[str]:
-        yield from chain.from_iterable(r.error_details for r in self.partitions)
+    def top_error_details(self) -> Generator[str]:
+        yield from chain.from_iterable(r.error_details for r in self.partitions[:_TOP_ERRORS])
 
 
 async def index_partition(
@@ -272,7 +275,7 @@ async def index_partition(
         # Upsert all photo rows for this partition.
         await lance_index.upsert_partition(partition, photo_entries, thumbnail_lookup or None)
 
-        # Delete photos removed from disk.
+        # Delete from index photos removed from disk.
         if deleted_filenames:
             deleted_hashes = [existing_by_filename[fn] for fn in deleted_filenames]
             await lance_index.delete(partition, deleted_hashes)
@@ -280,7 +283,7 @@ async def index_partition(
         summary = await compute_partition_summary(lance_index, partition)
 
     # Update the backend-wide summary.json — separate root lock inside upsert.
-    if summary is not None:
+    if summary is not None:  # Prune empty partitions
         try:
             await manifest_store.upsert_partition_in_summary(summary)
         except Exception as exc:
@@ -392,10 +395,16 @@ async def index_library(
         return result
 
     _t0 = time.monotonic()
-    library_result.partitions = list(await asyncio.gather(*(_index_one(p) for p in partitions)))
+    partition_index_res = await asyncio.gather(*(_index_one(p) for p in partitions))
+    # Prune empty partitions
+    library_result.partitions = list(
+        p
+        for p in partition_index_res
+        if (p.photos_processed > 0 or p.photos_skipped > 0 or p.photos_deleted > 0 or p.errors > 0)
+    )
 
     # Remove stale partitions (in summary.json but no longer on disk).
-    indexed_paths = {r.partition for r in library_result.partitions}
+    indexed_paths = {r.partition for r in partition_index_res}
     library_result.partitions_deleted = await _prune_deleted_partitions(
         backend, manifest_store, lance_index, indexed_paths
     )
@@ -449,11 +458,10 @@ async def _prune_deleted_partitions(
     lance_index: LanceIndex,
     indexed_paths: set[str],
 ) -> int:
-    """Remove stale partition entries from summary.json, LanceDB, and metadata dirs.
+    """Remove stale partition entries from summary.json, LanceDB,
 
-    Called after ``index_library`` completes.  Compares the set of discovered
-    partitions against the existing ``summary.json`` and removes any partition
-    no longer present on disk.
+    Compares the set of discovered partitions against the existing ``summary.json``
+    and removes any partition no longer present on disk.
 
     Returns:
         Number of partitions removed.
@@ -463,7 +471,7 @@ async def _prune_deleted_partitions(
     except FileNotFoundError:
         return 0
 
-    stale = [p for p in existing_summary.partitions if p.path not in indexed_paths]
+    stale = [p for p in existing_summary.partitions if p.path not in indexed_paths and p.path != ""]
     if not stale:
         return 0
 

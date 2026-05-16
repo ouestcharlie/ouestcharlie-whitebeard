@@ -27,9 +27,9 @@ Indexes all photos directly in one folder (direct children only — subdirectori
 3. Detect photos in the index but no longer on disk — log and schedule for deletion.
 4. For each photo: if already indexed and `force_full_index=False`, skip (incremental). Otherwise read or create XMP sidecar. If `force_extract_exif=True`, re-extract and overwrite.
 5. If `generate_thumbnails=True` and there are new photos, generate AVIF chunks for newly-processed photos only (or all when `force_full_index=True`).
-6. Delete stale rows from the index; write all current entries via `LanceIndex.upsert_partition` (preserving existing thumbnail data for unchanged photos).
-7. Compute `ManifestSummary` via `compute_partition_summary` — a DuckDB aggregate query over the LanceDB index.
-8. Write the summary to the backend-wide `summary.json` via `ManifestStore.upsert_partition_in_summary`.
+6. Delete stale rows from the index; write all current entries in LanceIndex (preserving existing thumbnail data for unchanged photos).
+7. Compute `ManifestSummary` using a DuckDB aggregate query over the LanceDB index.
+8. Write the summary to the backend-wide `summary.json`.
 
 **Returns:** `IndexResult` (photos processed, skipped, deleted, sidecars created/skipped, errors, duration).
 
