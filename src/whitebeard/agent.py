@@ -175,12 +175,12 @@ class WhitebeardAgent(AgentBase):
             return {
                 "partitionsIndexed": len(result.partitions),
                 "partitionsDeleted": result.partitions_deleted,
-                "totalPhotos": result.total_photos,
+                "totalPhotosProcessed": result.total_photos_processed,
                 "totalPhotosSkipped": result.total_photos_skipped,
                 "totalPhotosDeleted": result.total_photos_deleted,
                 "totalSidecarsCreated": result.total_sidecars_created,
                 "totalThumbnailsRebuilt": result.total_thumbnails_rebuilt,
                 "totalErrors": result.total_errors,
-                "errorDetails": list(result.error_details),
+                "topErrorDetails": list(result.top_error_details),
                 "totalDurationMs": result.total_duration_ms,
             }

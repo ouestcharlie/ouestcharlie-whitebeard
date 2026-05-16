@@ -310,7 +310,83 @@ async def test_index_library_single_partition(tmpdir: Path) -> None:
 
     assert isinstance(result, LibraryIndexResult)
     assert len(result.partitions) == 1
-    assert result.total_photos == 1
+    assert result.total_photos_processed == 1
+
+
+@pytest.mark.asyncio
+async def test_index_library_one_partition_empty(tmpdir: Path) -> None:
+    """index_library with one empty partition pruned."""
+    (tmpdir / "2024" / "2024-07").mkdir(parents=True)
+    (tmpdir / "2024" / "2024-07" / "a.jpg").write_bytes(_MINIMAL_JPEG)
+    (tmpdir / "2024" / "2024-08").mkdir(parents=True)  # Empty
+    backend = LocalBackend(root=tmpdir)
+
+    result = await index_library(backend)
+
+    assert isinstance(result, LibraryIndexResult)
+    assert len(result.partitions) == 1
+    assert result.total_photos_processed == 1
+
+
+@pytest.mark.asyncio
+async def test_index_library_one_partition_empty_update(tmpdir: Path) -> None:
+    """index_library with one empty partition pruned."""
+    (tmpdir / "2024" / "2024-07").mkdir(parents=True)
+    (tmpdir / "2024" / "2024-07" / "a.jpg").write_bytes(_MINIMAL_JPEG)
+    (tmpdir / "2024" / "2024-08").mkdir(parents=True)  # Empty
+    backend = LocalBackend(root=tmpdir)
+
+    await index_library(backend)
+    # second run — should not duplicate
+    result = await index_library(backend)
+
+    assert isinstance(result, LibraryIndexResult)
+    assert len(result.partitions) == 1
+    assert result.total_photos_processed == 0
+    assert result.total_photos_skipped == 1
+
+
+@pytest.mark.asyncio
+async def test_index_library_one_partition_empty_parent_update(tmpdir: Path) -> None:
+    """index_library with one empty partition pruned."""
+    # Directories
+    (tmpdir / "2024" / "2024-07").mkdir(parents=True)
+    # Images
+    (tmpdir / "2024" / "a.jpg").write_bytes(_MINIMAL_JPEG)
+    (tmpdir / "2024" / "2024-07" / "a.jpg").write_bytes(_MINIMAL_JPEG)
+    backend = LocalBackend(root=tmpdir)
+
+    result = await index_library(backend)
+    assert len(result.partitions) == 2
+    assert result.total_photos_processed == 2
+    assert result.total_photos_skipped == 0
+    assert result.total_photos_deleted == 0
+    assert result.total_errors == 0
+
+    # delete and clear partition "2024" but keep sub-partitions
+    (tmpdir / "2024" / "a.jpg").unlink()
+
+    # second run — process deletion
+    result = await index_library(backend)
+
+    assert isinstance(result, LibraryIndexResult)
+    assert len(result.partitions) == 2.0  # Logging deletion
+    assert result.partitions_deleted == 0  # Parent is kept
+    assert result.total_photos_processed == 0
+    assert result.total_photos_skipped == 1
+    assert result.total_photos_deleted == 1
+    assert result.total_errors == 0
+
+    # third run — nothing to do
+    result = await index_library(backend)
+
+    assert isinstance(result, LibraryIndexResult)
+    assert len(result.partitions) == 1.0
+    assert result.partitions_deleted == 0
+    assert result.total_photos_processed == 0
+    assert result.total_photos_skipped == 1
+    assert result.total_photos_deleted == 0
+    assert result.total_errors == 0
 
 
 @pytest.mark.asyncio
@@ -359,7 +435,7 @@ async def test_index_library_writes_summary_json(tmpdir: Path) -> None:
 
     result = await index_library(backend)
 
-    assert result.total_photos == 2
+    assert result.total_photos_processed == 2
     # summary.json lists all indexed partitions.
     data = json.loads((tmpdir / ".ouestcharlie" / "summary.json").read_text())
     paths = {p["path"] for p in data["partitions"]}
@@ -425,7 +501,7 @@ async def test_index_library_result_totals(tmpdir: Path) -> None:
 
     result = await index_library(backend)
 
-    assert result.total_photos == 2
+    assert result.total_photos_processed == 2
     assert result.total_sidecars_created == 2
     assert result.total_errors == 0
 
@@ -441,7 +517,7 @@ async def test_index_library_idempotent(tmpdir: Path) -> None:
     result2 = await index_library(backend)
 
     # In incremental mode, the second run carries over already-indexed photos.
-    assert result2.total_photos == 0  # no newly processed photos
+    assert result2.total_photos_processed == 0  # no newly processed photos
     assert result2.total_photos_skipped == 1  # one photo carried over from manifest
     assert result2.total_sidecars_created == 0  # sidecar already exists
     assert result2.total_errors == 0
@@ -604,7 +680,7 @@ async def test_index_library_forces_full_reindex_on_schema_upgrade(tmpdir: Path)
     # Second run (incremental by default) — must detect stale version and force full reindex.
     result = await index_library(backend)
 
-    assert result.total_photos > 0  # all photos re-processed, none skipped
+    assert result.total_photos_processed > 0  # all photos re-processed, none skipped
     assert result.total_photos_skipped == 0
 
 
@@ -618,7 +694,7 @@ async def test_index_library_no_forced_reindex_when_schema_current(tmpdir: Path)
     await index_library(backend)
     result = await index_library(backend)  # incremental — schema version matches
 
-    assert result.total_photos == 0  # no re-processing
+    assert result.total_photos_processed == 0  # no re-processing
     assert result.total_photos_skipped > 0  # photo carried over from manifest
 
 
