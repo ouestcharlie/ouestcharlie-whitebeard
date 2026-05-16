@@ -477,9 +477,9 @@ async def test_index_library_summary_photo_count(tmpdir: Path) -> None:
     """summary.json photoCount per partition matches actual photo count."""
     (tmpdir / "A").mkdir()
     (tmpdir / "B").mkdir()
-    (tmpdir / "A" / "p1.jpg").write_bytes(_MINIMAL_JPEG)
-    (tmpdir / "A" / "p2.jpg").write_bytes(_MINIMAL_JPEG)
-    (tmpdir / "B" / "p3.jpg").write_bytes(_MINIMAL_JPEG)
+    (tmpdir / "A" / "p1.jpg").write_bytes(_MINIMAL_JPEG + b"1")
+    (tmpdir / "A" / "p2.jpg").write_bytes(_MINIMAL_JPEG + b"2")
+    (tmpdir / "B" / "p3.jpg").write_bytes(_MINIMAL_JPEG + b"1")  # Same as p1.jpg
     backend = LocalBackend(root=tmpdir)
 
     await index_library(backend)
