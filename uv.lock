@@ -594,7 +594,7 @@ dev = [
 
 [[package]]
 name = "ouestcharlie-whitebeard"
-version = "0.8.2"
+version = "0.8.1"
 source = { editable = "." }
 dependencies = [
     { name = "mcp" },
