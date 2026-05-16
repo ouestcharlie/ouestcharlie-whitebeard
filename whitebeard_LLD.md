@@ -77,7 +77,7 @@ Each `index_partition` call is independent: it upserts its rows into the shared 
 
 ## LanceDB Write
 
-`LanceIndex.upsert_partition` receives the final `list[PhotoEntry]` and a `thumbnail_lookup` for newly-generated chunks. It pre-queries existing thumbnail data so that photos absent from the lookup retain their existing AVIF reference — preventing incremental runs from wiping thumbnails. Rows are merged on `content_hash` (update if matched, insert if not). Stale photo deletion is handled separately by the caller before this step.
+`LanceIndex.upsert_partition` receives the final `list[PhotoEntry]` and a `thumbnail_lookup` for newly-generated chunks. It pre-queries existing thumbnail data so that photos absent from the lookup retain their existing AVIF reference — preventing incremental runs from wiping thumbnails. Rows are merged on `(partition, content_hash)` (update if matched, insert if not). This allows the same content hash to exist in multiple partitions as independent rows, preventing cross-partition collision where indexing one folder would overwrite another folder's row for a duplicate file. Within each partition batch, entries with a duplicate `content_hash` are deduplicated before the merge — the first occurrence is kept and a warning is logged — preventing undefined behavior when two files in the same partition share identical content. Stale photo deletion is handled separately by the caller before this step.
 
 After the upsert, `compute_partition_summary` runs aggregates query over the index to produce the `ManifestSummary` (photo count, date range, GPS bbox, rating range), which is then written to `summary.json`.
 
