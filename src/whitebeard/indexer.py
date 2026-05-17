@@ -109,7 +109,8 @@ class LibraryIndexResult:
 
     @property
     def top_error_details(self) -> Generator[str]:
-        yield from chain.from_iterable(r.error_details for r in self.partitions[:_TOP_ERRORS])
+        for _ in range(_TOP_ERRORS):
+            yield from chain.from_iterable(r.error_details for r in self.partitions)
 
 
 async def index_partition(
@@ -408,6 +409,8 @@ async def index_library(
     library_result.partitions_deleted = await _prune_deleted_partitions(
         backend, manifest_store, lance_index, indexed_paths
     )
+
+    await lance_index.maintain()
 
     library_result.total_duration_ms = round((time.monotonic() - _t0) * 1000)
     return library_result
