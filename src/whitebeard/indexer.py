@@ -185,10 +185,11 @@ async def index_partition(
         existing_by_filename: dict[str, str] = {}
         deleted_filenames: set[str] | None = None
         if not force_full_index:
-            existing_rows = await lance_index.get_partition_rows(
+            existing_by_filename: dict[str, str] = {}
+            async for row in lance_index.get_partition_rows(
                 partition, columns=["filename", "content_hash"]
-            )
-            existing_by_filename = {row["filename"]: row["content_hash"] for row in existing_rows}
+            ):
+                existing_by_filename[row["filename"]] = row["content_hash"]
             deleted_filenames = existing_by_filename.keys() - disk_filenames
             result.photos_deleted = len(deleted_filenames)
             if deleted_filenames:

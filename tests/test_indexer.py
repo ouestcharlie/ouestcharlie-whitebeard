@@ -103,7 +103,7 @@ async def test_index_manifest_photo_entry(backend_with_sample: LocalBackend) -> 
     """The LanceDB index contains a photo entry with the correct filename and hash."""
     await index_partition(backend_with_sample, "")
     lance_index = await LanceIndex.open(backend_with_sample, PHOTO_TABLE_NAME)
-    rows = await lance_index.get_partition_rows("")
+    rows = [r async for r in lance_index.get_partition_rows("")]
     assert len(rows) == 1
     assert rows[0]["filename"] == "001.jpg"
     assert len(rows[0]["content_hash"]) == 22
@@ -257,7 +257,7 @@ async def test_index_ignores_subdirectory_photos(tmpdir: Path) -> None:
 
     assert result.photos_processed == 1  # only top.jpg
     lance_index = await LanceIndex.open(backend, PHOTO_TABLE_NAME)
-    rows = await lance_index.get_partition_rows("")
+    rows = [r async for r in lance_index.get_partition_rows("")]
     assert len(rows) == 1
     assert rows[0]["filename"] == "top.jpg"
 
@@ -803,7 +803,7 @@ async def test_incremental_processes_new_photos_in_existing_partition(tmpdir: Pa
 
     # Both photos must appear in the index.
     lance_index_obj = await LanceIndex.open(backend, PHOTO_TABLE_NAME)
-    rows = await lance_index_obj.get_partition_rows("")
+    rows = [r async for r in lance_index_obj.get_partition_rows("")]
     filenames = {r["filename"] for r in rows}
     assert "existing.jpg" in filenames
     assert "new.jpg" in filenames
@@ -836,7 +836,7 @@ async def test_incremental_removes_deleted_photos_from_manifest(
 
     # Index must only contain keep.jpg.
     lance_index_obj = await LanceIndex.open(backend, PHOTO_TABLE_NAME)
-    rows = await lance_index_obj.get_partition_rows("")
+    rows = [r async for r in lance_index_obj.get_partition_rows("")]
     filenames = {r["filename"] for r in rows}
     assert "keep.jpg" in filenames
     assert "delete.jpg" not in filenames
