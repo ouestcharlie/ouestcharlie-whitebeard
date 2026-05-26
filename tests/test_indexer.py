@@ -490,6 +490,38 @@ async def test_index_library_summary_photo_count(tmpdir: Path) -> None:
     assert counts["B"] == 1
 
 
+def test_top_error_details_caps_at_ten() -> None:
+    """top_error_details yields at most _TOP_ERRORS (10) messages across all partitions."""
+    result = LibraryIndexResult(
+        partitions=[
+            IndexResult("p1", errors=7, error_details=[f"p1-err-{i}" for i in range(7)]),
+            IndexResult("p2", errors=7, error_details=[f"p2-err-{i}" for i in range(7)]),
+        ]
+    )
+    details = list(result.top_error_details)
+    assert len(details) == 10
+    # First errors come from p1 (in order), then p2 up to the cap.
+    assert details[:7] == [f"p1-err-{i}" for i in range(7)]
+    assert details[7:] == ["p2-err-0", "p2-err-1", "p2-err-2"]
+
+
+def test_top_error_details_fewer_than_ten() -> None:
+    """top_error_details yields all errors when total count is below the cap."""
+    result = LibraryIndexResult(
+        partitions=[
+            IndexResult("p1", errors=2, error_details=["e1", "e2"]),
+            IndexResult("p2", errors=1, error_details=["e3"]),
+        ]
+    )
+    assert list(result.top_error_details) == ["e1", "e2", "e3"]
+
+
+def test_top_error_details_no_errors() -> None:
+    """top_error_details yields nothing when there are no errors."""
+    result = LibraryIndexResult(partitions=[IndexResult("p1")])
+    assert list(result.top_error_details) == []
+
+
 @pytest.mark.asyncio
 async def test_index_library_result_totals(tmpdir: Path) -> None:
     """LibraryIndexResult aggregates counts across all partitions."""

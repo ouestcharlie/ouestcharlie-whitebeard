@@ -7,7 +7,7 @@ import logging
 import time
 from collections.abc import Awaitable, Callable, Generator
 from dataclasses import dataclass, field
-from itertools import chain
+from itertools import chain, islice
 from pathlib import PurePath
 
 from ouestcharlie_toolkit.backend import Backend
@@ -109,8 +109,9 @@ class LibraryIndexResult:
 
     @property
     def top_error_details(self) -> Generator[str]:
-        for _ in range(_TOP_ERRORS):
-            yield from chain.from_iterable(r.error_details for r in self.partitions)
+        yield from islice(
+            chain.from_iterable(r.error_details for r in self.partitions), _TOP_ERRORS
+        )
 
 
 async def index_partition(
