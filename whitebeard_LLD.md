@@ -42,6 +42,7 @@ Indexes the entire library under the backend root.
 2. Dispatch collected partitions to `index_partition` in parallel, capped at `_MAX_CONCURRENT_PARTITIONS = 4` concurrent workers (via `asyncio.Semaphore`). The cap is kept low because thumbnail generation is already multi-threaded; going wider would over-saturate I/O.
 3. Progress is reported after each partition completes (not while it is running).
 4. After all partitions are indexed, compare the discovered partition set against `summary.json`. Remove stale entries from `summary.json` and delete their rows from the LanceDB index via `LanceIndex.delete_partition`, then delete their per-partition `.ouestcharlie/<partition>/` directories (thumbnails) via `backend.delete_dir()`.
+5. Call `await lance_index.maintain()` to compact LanceDB fragment files and prune version history older than 1 hour (`table.optimize(cleanup_older_than=timedelta(hours=1))`). This keeps the index lean so consecutive runs reclaim space from each other.
 
 **Returns:** `LibraryIndexResult` aggregating all per-partition `IndexResult` values plus `partitions_deleted`.
 
@@ -98,9 +99,11 @@ Called by `index_library` after the gather step. Compares the BFS-discovered par
 
 A safety guard in `_delete_partition_metadata` verifies the computed metadata path starts with `.ouestcharlie/` before deletion.
 
-## Error Isolation
+## Error Reporting
 
 Per-photo errors are caught and recorded in `IndexResult.error_details`; they never abort the partition. Thumbnail and manifest errors are similarly caught and recorded. `index_library` has no additional isolation — a raised exception from `index_partition` would propagate through `asyncio.gather` and fail the whole library run (which is intentional: manifest corruption should surface loudly).
+
+`LibraryIndexResult.top_error_details` is a generator property that yields at most `_TOP_ERRORS` (10) messages, drawn in order from the flattened `error_details` of all partitions.
 
 ## Logging
 

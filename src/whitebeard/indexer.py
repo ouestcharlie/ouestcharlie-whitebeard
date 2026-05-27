@@ -7,7 +7,7 @@ import logging
 import time
 from collections.abc import Awaitable, Callable, Generator
 from dataclasses import dataclass, field
-from itertools import chain
+from itertools import chain, islice
 from pathlib import PurePath
 
 from ouestcharlie_toolkit.backend import Backend
@@ -109,8 +109,9 @@ class LibraryIndexResult:
 
     @property
     def top_error_details(self) -> Generator[str]:
-        for _ in range(_TOP_ERRORS):
-            yield from chain.from_iterable(r.error_details for r in self.partitions)
+        yield from islice(
+            chain.from_iterable(r.error_details for r in self.partitions), _TOP_ERRORS
+        )
 
 
 async def index_partition(
@@ -185,10 +186,11 @@ async def index_partition(
         existing_by_filename: dict[str, str] = {}
         deleted_filenames: set[str] | None = None
         if not force_full_index:
-            existing_rows = await lance_index.get_partition_rows(
+            existing_by_filename: dict[str, str] = {}
+            async for row in lance_index.get_partition_rows(
                 partition, columns=["filename", "content_hash"]
-            )
-            existing_by_filename = {row["filename"]: row["content_hash"] for row in existing_rows}
+            ):
+                existing_by_filename[row["filename"]] = row["content_hash"]
             deleted_filenames = existing_by_filename.keys() - disk_filenames
             result.photos_deleted = len(deleted_filenames)
             if deleted_filenames:
