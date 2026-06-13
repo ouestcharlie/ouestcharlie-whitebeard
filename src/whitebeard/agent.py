@@ -170,8 +170,10 @@ class WhitebeardAgent(AgentBase):
                     on_progress=_library_progress,
                 )
             except Exception as exc:
-                _log.error("index_library failed: %s", exc, exc_info=True)
-                raise
+                # TaskGroup wraps partition failures in an ExceptionGroup — unwrap the first.
+                cause = exc.exceptions[0] if isinstance(exc, BaseExceptionGroup) else exc
+                _log.error("index_library failed: %s", cause, exc_info=cause)
+                raise cause from exc
             return {
                 "partitionsIndexed": len(result.partitions),
                 "partitionsDeleted": result.partitions_deleted,
