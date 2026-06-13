@@ -2,7 +2,7 @@
 
 ## Testing
 
-Never use `python`, `python3`, or `uv run pytest` — same reasons as py-toolkit.
+Use `.venv/bin/pytest tests/ -v`. Never use `python`, `python3`, or `uv run pytest` — same reasons as py-toolkit.
 
 ## MCP Error Handling
 
