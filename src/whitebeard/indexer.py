@@ -11,10 +11,7 @@ from itertools import chain, islice
 from pathlib import PurePath
 
 from ouestcharlie_toolkit.backend import Backend
-from ouestcharlie_toolkit.lance_index import (
-    PHOTO_TABLE_NAME,
-    LanceIndex,
-)
+from ouestcharlie_toolkit.lance_index import PHOTO_TABLE_NAME, LanceIndex
 from ouestcharlie_toolkit.manifest import ManifestStore
 from ouestcharlie_toolkit.partition_summary import compute_partition_summary
 from ouestcharlie_toolkit.schema import (
@@ -276,14 +273,16 @@ async def index_partition(
                     result.error_details.append(f"thumbnails: {exc}")
 
         # Upsert all photo rows for this partition.
-        await lance_index.upsert_partition(partition, photo_entries, thumbnail_lookup or None)
+        if len(photo_entries) > 0:
+            await lance_index.upsert_partition(partition, photo_entries, thumbnail_lookup or None)
 
         # Delete from index photos removed from disk.
         if deleted_filenames:
             deleted_hashes = [existing_by_filename[fn] for fn in deleted_filenames]
             await lance_index.delete(partition, deleted_hashes)
 
-        summary = await compute_partition_summary(lance_index, partition)
+        if len(photo_entries) > 0 or (deleted_filenames and len(deleted_filenames) > 0):
+            summary = await compute_partition_summary(lance_index, partition)
 
     # Update the backend-wide summary.json — separate root lock inside upsert.
     if summary is not None:  # Prune empty partitions
@@ -398,7 +397,9 @@ async def index_library(
         return result
 
     _t0 = time.monotonic()
-    partition_index_res = await asyncio.gather(*(_index_one(p) for p in partitions))
+    async with asyncio.TaskGroup() as tg:
+        tasks = [tg.create_task(_index_one(p)) for p in partitions]
+    partition_index_res = tuple(t.result() for t in tasks)
     # Prune empty partitions
     library_result.partitions = list(
         p
