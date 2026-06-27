@@ -27,6 +27,10 @@ tests/
 pip install whitebeard
 ```
 
+System prerequisites:
+- **macOS**: `brew install inih brotli gettext` (required by pyexiv2 at runtime)
+- **Linux/Windows**: no extra steps
+
 ### From source (development)
 
 Requires the sibling `ouestcharlie-py-toolkit` repo and a built `image-proc` binary (see its README_DEV.md):
