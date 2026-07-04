@@ -8,7 +8,7 @@ import time
 from collections.abc import Awaitable, Callable, Generator
 from dataclasses import dataclass, field
 from itertools import chain, islice
-from pathlib import PurePath
+from pathlib import Path, PurePath
 
 from ouestcharlie_toolkit.backend import Backend
 from ouestcharlie_toolkit.lance_index import PHOTO_TABLE_NAME, LanceIndex
@@ -118,6 +118,7 @@ async def index_partition(
     generate_thumbnails: bool = False,
     force_full_index: bool = False,
     lance_index: LanceIndex | None = None,
+    lance_index_path: Path | None = None,
 ) -> IndexResult:
     """Index all photos in a partition (index mode — files stay in place).
 
@@ -169,7 +170,12 @@ async def index_partition(
     xmp_store = XmpStore(backend)
     manifest_store = ManifestStore(backend)
     if lance_index is None:
-        lance_index = await LanceIndex.open_or_create(backend, PHOTO_TABLE_NAME)
+        lance_index = await LanceIndex.open(
+            backend,
+            PHOTO_TABLE_NAME,
+            create_if_missing=True,
+            index_path=lance_index_path,
+        )
 
     # List only direct-child photo files — read-only, no lock needed.
     photo_files = await backend.list_files(partition, PHOTO_EXTENSIONS)
@@ -308,6 +314,7 @@ async def index_library(
     generate_thumbnails: bool = False,
     force_full_index: bool = False,
     on_progress: Callable[[int, int, str, int, int], Awaitable[None]] | None = None,
+    lance_index_path: Path | None = None,
 ) -> LibraryIndexResult:
     """Index all photos in a library.
 
@@ -365,7 +372,12 @@ async def index_library(
     # concurrent call to index_partition would otherwise call create_table()
     # independently; on Lance 4.x that races an Overwrite transaction against
     # in-flight Update (merge_insert) transactions and raises an MVCC conflict.
-    lance_index = await LanceIndex.open_or_create(backend, PHOTO_TABLE_NAME)
+    lance_index = await LanceIndex.open(
+        backend,
+        PHOTO_TABLE_NAME,
+        create_if_missing=True,
+        index_path=lance_index_path,
+    )
 
     # Index partitions in parallel, capped at _MAX_CONCURRENT_PARTITIONS workers.
     # Thumbnail generation is already multi-threaded internally, so a low cap

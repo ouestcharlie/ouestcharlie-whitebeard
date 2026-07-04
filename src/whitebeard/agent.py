@@ -84,6 +84,7 @@ class WhitebeardAgent(AgentBase):
                     force_extract_exif,
                     generate_thumbnails=generate_thumbnails,
                     force_full_index=force_full_index,
+                    lance_index_path=self.lance_index_path_override,
                 )
             except Exception as exc:
                 _log.error(
@@ -168,6 +169,7 @@ class WhitebeardAgent(AgentBase):
                     generate_thumbnails=generate_thumbnails,
                     force_full_index=force_full_index,
                     on_progress=_library_progress,
+                    lance_index_path=self.lance_index_path_override,
                 )
             except Exception as exc:
                 # TaskGroup wraps partition failures in an ExceptionGroup — unwrap the first.

@@ -1,7 +1,7 @@
 """Entry point for the Whitebeard MCP agent.
 
 For mcp dev / MCP Inspector:
-    WOOF_BACKEND_CONFIG='{"type":"filesystem","root":"/path/to/photos"}' \\
+    WOOF_BACKEND_CONFIG='{"type":"filesystem","path":"/path/to/photos"}' \\
         mcp dev src/whitebeard/__main__.py
 
 For production (stdio transport):
