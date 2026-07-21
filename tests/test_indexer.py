@@ -68,7 +68,8 @@ def backend_with_minimal(tmpdir: Path) -> LocalBackend:
 async def test_index_creates_xmp_sidecar(backend_with_sample: LocalBackend, tmpdir: Path) -> None:
     """index_partition writes an XMP sidecar next to the photo."""
     await index_partition(backend_with_sample, "")
-    assert (tmpdir / "001.xmp").exists()
+    # New sidecars use the full-extension convention (Darktable/digiKam-compatible, OEC-25).
+    assert (tmpdir / "001.jpg.xmp").exists()
 
 
 @pytest.mark.asyncio
@@ -77,7 +78,7 @@ async def test_index_sidecar_has_content_hash(
 ) -> None:
     """The created XMP sidecar contains an ouestcharlie:contentHash."""
     await index_partition(backend_with_sample, "")
-    sidecar = parse_xmp((tmpdir / "001.xmp").read_text(encoding="utf-8"))
+    sidecar = parse_xmp((tmpdir / "001.jpg.xmp").read_text(encoding="utf-8"))
     assert sidecar.content_hash is not None
     assert len(sidecar.content_hash) == 22
 
@@ -88,7 +89,7 @@ async def test_index_sidecar_has_camera_fields(
 ) -> None:
     """The created XMP sidecar contains make/model extracted from EXIF."""
     await index_partition(backend_with_sample, "")
-    sidecar = parse_xmp((tmpdir / "001.xmp").read_text(encoding="utf-8"))
+    sidecar = parse_xmp((tmpdir / "001.jpg.xmp").read_text(encoding="utf-8"))
     assert sidecar.camera_make is not None
     assert sidecar.camera_model is not None
 
@@ -205,11 +206,11 @@ async def test_index_force_overwrites_sidecar(
     backend_with_sample: LocalBackend, tmpdir: Path
 ) -> None:
     """With force=True, an existing XMP sidecar is replaced with fresh EXIF data."""
-    # First index run creates the sidecar.
+    # First index run creates the sidecar (full-extension convention, OEC-25).
     await index_partition(backend_with_sample, "")
 
     # Overwrite the sidecar with a sentinel.
-    xmp_path = tmpdir / "001.xmp"
+    xmp_path = tmpdir / "001.jpg.xmp"
     xmp_path.write_text("<!-- overwritten -->", encoding="utf-8")
 
     # force_full_index=True is required alongside force_extract_exif so that the photo
