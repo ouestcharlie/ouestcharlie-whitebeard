@@ -111,31 +111,23 @@ async def test_index_manifest_photo_entry(backend_with_sample: LocalBackend) -> 
 
 
 @pytest.mark.asyncio
-async def test_index_manifest_summary(backend_with_sample: LocalBackend) -> None:
-    """The root summary reflects the photo count after indexing."""
+async def test_index_partition_alone_does_not_write_summary(
+    backend_with_sample: LocalBackend, tmpdir: Path
+) -> None:
+    """indexer.index_partition() is pure LanceDB/XMP logic — it never touches summary.json.
+
+    summary.json is written once per session by whichever caller owns the
+    session (index_library, or the index_partition MCP tool wrapper in
+    agent.py) — not by this lower-level function, so it can be run
+    concurrently across partitions without contending on a shared file.
+    """
     await index_partition(backend_with_sample, "")
-    store = ManifestStore(backend_with_sample)
-    summary, _ = await store.read_summary()
-    partition = next(p for p in summary.partitions if p.path == "")
-    assert partition.photo_count == 1
+    assert not (tmpdir / ".ouestcharlie" / "summary.json").exists()
 
 
 @pytest.mark.asyncio
-async def test_index_manifest_has_date(backend_with_sample: LocalBackend) -> None:
-    """The partition summary has a date range when the photo has EXIF date."""
-    await index_partition(backend_with_sample, "")
-    store = ManifestStore(backend_with_sample)
-    summary, _ = await store.read_summary()
-    partition = next(p for p in summary.partitions if p.path == "")
-    # 001.jpg has EXIF DateTimeOriginal
-    assert "dateTaken" in partition._stats
-    assert "min" in partition._stats["dateTaken"]
-    assert "max" in partition._stats["dateTaken"]
-
-
-@pytest.mark.asyncio
-async def test_index_manifest_summary_rating_range(tmpdir: Path) -> None:
-    """Partition summary has rating min/max when photos have ratings."""
+async def test_index_manifest_rating_in_lance_index(tmpdir: Path) -> None:
+    """Rating extracted from EXIF/XMP ends up in the LanceDB row (aggregated at query time)."""
     from ouestcharlie_toolkit.schema import PhotoEntry, XmpSidecar
 
     (tmpdir / "a.jpg").write_bytes(_MINIMAL_JPEG)
@@ -159,25 +151,9 @@ async def test_index_manifest_summary_rating_range(tmpdir: Path) -> None:
     with patch("whitebeard.indexer._extract_one", side_effect=fake_process):
         await index_partition(backend, "")
 
-    store = ManifestStore(backend)
-    summary, _ = await store.read_summary()
-    partition = next(p for p in summary.partitions if p.path == "")
-    assert partition._stats["rating"]["min"] == 2
-    assert partition._stats["rating"]["max"] == 5
-
-
-@pytest.mark.asyncio
-async def test_index_manifest_summary_no_rating_when_unrated(tmpdir: Path) -> None:
-    """Rating stats are absent from the summary when no photo has a rating."""
-    (tmpdir / "photo.jpg").write_bytes(_MINIMAL_JPEG)
-    backend = LocalBackend(root=tmpdir)
-
-    await index_partition(backend, "")
-
-    store = ManifestStore(backend)
-    summary, _ = await store.read_summary()
-    partition = next(p for p in summary.partitions if p.path == "")
-    assert "rating" not in partition._stats
+    lance_index = await LanceIndex.open(backend, PHOTO_TABLE_NAME)
+    rows = [r async for r in lance_index.get_partition_rows("")]
+    assert sorted(r["rating"] for r in rows) == [2, 4, 5]
 
 
 # ---------------------------------------------------------------------------
@@ -291,9 +267,9 @@ async def test_index_sub_partition(tmpdir: Path) -> None:
 
     assert result.photos_processed == 1
     assert result.sidecars_created == 1
-    store = ManifestStore(backend)
-    summary, _ = await store.read_summary()
-    assert any(p.path == "Vacations/Italy" for p in summary.partitions)
+    lance_index = await LanceIndex.open(backend, PHOTO_TABLE_NAME)
+    rows = [r async for r in lance_index.get_partition_rows("Vacations/Italy")]
+    assert len(rows) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -391,43 +367,41 @@ async def test_index_library_one_partition_empty_parent_update(tmpdir: Path) -> 
 
 
 @pytest.mark.asyncio
-async def test_index_partition_writes_summary_json(tmpdir: Path) -> None:
-    """index_partition creates summary.json at the backend root."""
+async def test_index_library_writes_thin_summary_json(tmpdir: Path) -> None:
+    """index_library writes summary.json once, as the thin schema-version marker."""
     (tmpdir / "2024" / "2024-07").mkdir(parents=True)
     (tmpdir / "2024" / "2024-07" / "a.jpg").write_bytes(_MINIMAL_JPEG)
     backend = LocalBackend(root=tmpdir)
 
-    await index_partition(backend, "2024/2024-07")
+    await index_library(backend)
 
     summary_file = tmpdir / ".ouestcharlie" / "summary.json"
     assert summary_file.exists()
     data = json.loads(summary_file.read_text())
-    assert len(data["partitions"]) == 1
-    assert data["partitions"][0]["path"] == "2024/2024-07"
-    assert data["partitions"][0]["photoCount"] == 1
+    assert data["schemaVersion"] == SCHEMA_VERSION
+    assert "partitions" not in data
 
 
 @pytest.mark.asyncio
-async def test_index_partition_updates_existing_summary(tmpdir: Path) -> None:
-    """Re-indexing a partition replaces its entry in summary.json."""
+async def test_index_library_reindex_keeps_lance_rows_current(tmpdir: Path) -> None:
+    """Re-indexing a partition does not duplicate its LanceDB rows."""
     (tmpdir / "A").mkdir()
     (tmpdir / "A" / "p1.jpg").write_bytes(_unique_jpeg(0))
     (tmpdir / "A" / "p2.jpg").write_bytes(_unique_jpeg(1))
     backend = LocalBackend(root=tmpdir)
 
     await index_partition(backend, "A")
-
     # second run — should not duplicate
     await index_partition(backend, "A")
 
-    data = json.loads((tmpdir / ".ouestcharlie" / "summary.json").read_text())
-    assert len(data["partitions"]) == 1
-    assert data["partitions"][0]["photoCount"] == 2
+    lance_index = await LanceIndex.open(backend, PHOTO_TABLE_NAME)
+    rows = [r async for r in lance_index.get_partition_rows("A")]
+    assert len(rows) == 2
 
 
 @pytest.mark.asyncio
-async def test_index_library_writes_summary_json(tmpdir: Path) -> None:
-    """index_library produces summary.json listing all indexed partitions."""
+async def test_index_library_indexes_all_partitions(tmpdir: Path) -> None:
+    """index_library indexes every partition into LanceDB."""
     (tmpdir / "2024" / "2024-07").mkdir(parents=True)
     (tmpdir / "2024" / "2024-08").mkdir(parents=True)
     (tmpdir / "2024" / "2024-07" / "a.jpg").write_bytes(_MINIMAL_JPEG)
@@ -437,16 +411,15 @@ async def test_index_library_writes_summary_json(tmpdir: Path) -> None:
     result = await index_library(backend)
 
     assert result.total_photos_processed == 2
-    # summary.json lists all indexed partitions.
-    data = json.loads((tmpdir / ".ouestcharlie" / "summary.json").read_text())
-    paths = {p["path"] for p in data["partitions"]}
+    lance_index = await LanceIndex.open(backend, PHOTO_TABLE_NAME)
+    paths = await lance_index.list_partitions()
     assert "2024/2024-07" in paths
     assert "2024/2024-08" in paths
 
 
 @pytest.mark.asyncio
-async def test_index_library_summary_rating_range(tmpdir: Path) -> None:
-    """summary.json contains per-partition rating ranges."""
+async def test_index_library_lance_rating_per_partition(tmpdir: Path) -> None:
+    """Rating values land in the correct partition's LanceDB rows."""
     from ouestcharlie_toolkit.schema import XmpSidecar
     from ouestcharlie_toolkit.xmp import serialize_xmp
 
@@ -464,18 +437,16 @@ async def test_index_library_summary_rating_range(tmpdir: Path) -> None:
 
     await index_library(backend)
 
-    data = json.loads((tmpdir / ".ouestcharlie" / "summary.json").read_text())
-    part_a = next(p for p in data["partitions"] if p["path"] == "A")
-    part_b = next(p for p in data["partitions"] if p["path"] == "B")
-    assert part_a["rating"]["min"] == 2
-    assert part_a["rating"]["max"] == 4
-    assert part_b["rating"]["min"] == 5
-    assert part_b["rating"]["max"] == 5
+    lance_index = await LanceIndex.open(backend, PHOTO_TABLE_NAME)
+    ratings_a = sorted([r["rating"] async for r in lance_index.get_partition_rows("A")])
+    ratings_b = sorted([r["rating"] async for r in lance_index.get_partition_rows("B")])
+    assert ratings_a == [2, 4]
+    assert ratings_b == [5]
 
 
 @pytest.mark.asyncio
-async def test_index_library_summary_photo_count(tmpdir: Path) -> None:
-    """summary.json photoCount per partition matches actual photo count."""
+async def test_index_library_lance_photo_count_per_partition(tmpdir: Path) -> None:
+    """LanceDB row count per partition matches the actual photo count on disk."""
     (tmpdir / "A").mkdir()
     (tmpdir / "B").mkdir()
     (tmpdir / "A" / "p1.jpg").write_bytes(_MINIMAL_JPEG + b"1")
@@ -485,10 +456,11 @@ async def test_index_library_summary_photo_count(tmpdir: Path) -> None:
 
     await index_library(backend)
 
-    data = json.loads((tmpdir / ".ouestcharlie" / "summary.json").read_text())
-    counts = {p["path"]: p["photoCount"] for p in data["partitions"]}
-    assert counts["A"] == 2
-    assert counts["B"] == 1
+    lance_index = await LanceIndex.open(backend, PHOTO_TABLE_NAME)
+    rows_a = [r async for r in lance_index.get_partition_rows("A")]
+    rows_b = [r async for r in lance_index.get_partition_rows("B")]
+    assert len(rows_a) == 2
+    assert len(rows_b) == 1
 
 
 def test_top_error_details_caps_at_ten() -> None:
@@ -703,11 +675,8 @@ async def test_index_library_forces_full_reindex_on_schema_upgrade(tmpdir: Path)
 
     # Downgrade the summary schema version to simulate an old index.
     store = ManifestStore(backend)
-    current_summary, version = await store.read_summary()
-    stale = RootSummary(
-        schema_version=SCHEMA_VERSION - 1,
-        partitions=current_summary.partitions,
-    )
+    _current_summary, version = await store.read_summary()
+    stale = RootSummary(schema_version=SCHEMA_VERSION - 1)
     await store.write_summary(stale, version)
 
     # Second run (incremental by default) — must detect stale version and force full reindex.
@@ -993,8 +962,8 @@ async def test_incremental_generates_new_thumbnail_chunk_when_photo_added(
 
 
 @pytest.mark.asyncio
-async def test_index_library_removes_stale_partition_from_summary(tmpdir: Path) -> None:
-    """After a partition directory is deleted, the next library run removes it from summary.json."""
+async def test_index_library_removes_stale_partition_from_lance(tmpdir: Path) -> None:
+    """After a partition directory is deleted, the next library run removes it from LanceDB."""
     (tmpdir / "A").mkdir()
     (tmpdir / "A" / "p.jpg").write_bytes(_MINIMAL_JPEG)
     (tmpdir / "B").mkdir()
@@ -1008,9 +977,8 @@ async def test_index_library_removes_stale_partition_from_summary(tmpdir: Path) 
 
     result = await index_library(backend)
 
-    summary_data = json.loads((tmpdir / ".ouestcharlie" / "summary.json").read_text())
-    paths = {p["path"] for p in summary_data["partitions"]}
-    assert "B" not in paths
+    lance_index = await LanceIndex.open(backend, PHOTO_TABLE_NAME)
+    assert "B" not in await lance_index.list_partitions()
     assert result.partitions_deleted == 1
 
 
@@ -1048,9 +1016,8 @@ async def test_index_library_does_not_touch_active_partitions(tmpdir: Path) -> N
     shutil.rmtree(tmpdir / "Gone")
     await index_library(backend)
 
-    summary_data = json.loads((tmpdir / ".ouestcharlie" / "summary.json").read_text())
-    paths = {p["path"] for p in summary_data["partitions"]}
-    assert "Keep" in paths
+    lance_index = await LanceIndex.open(backend, PHOTO_TABLE_NAME)
+    assert "Keep" in await lance_index.list_partitions()
 
 
 @pytest.mark.asyncio

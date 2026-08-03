@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime
 
 from mcp.server.fastmcp import Context
 from ouestcharlie_toolkit import report_progress
+from ouestcharlie_toolkit.manifest import ManifestStore
+from ouestcharlie_toolkit.schema import SCHEMA_VERSION, RootSummary
 from ouestcharlie_toolkit.server import AgentBase
 
 from .indexer import index_library, index_partition
@@ -94,6 +97,15 @@ class WhitebeardAgent(AgentBase):
                     exc_info=True,
                 )
                 raise
+
+            # This tool call is a standalone indexing session (not part of
+            # index_library's concurrent multi-partition fan-out, which
+            # writes the thin summary itself once at the end) — safe to
+            # write the thin summary.json marker once here too.
+            await ManifestStore(self.backend).write_full_summary(
+                RootSummary(schema_version=SCHEMA_VERSION, last_indexed_at=datetime.now(UTC))
+            )
+
             return {
                 "partition": result.partition,
                 "photosProcessed": result.photos_processed,
@@ -127,8 +139,8 @@ class WhitebeardAgent(AgentBase):
             every ancestor folder has an aggregate manifest summarising its
             children.
 
-            After indexing, partitions present in ``summary.json`` but no longer
-            on disk are removed from the summary and their
+            After indexing, previously-indexed partitions no longer on disk
+            are removed from the LanceDB index and their
             ``.ouestcharlie/<partition>/`` metadata directories are deleted.
 
             Args:

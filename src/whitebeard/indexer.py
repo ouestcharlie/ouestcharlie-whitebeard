@@ -7,13 +7,13 @@ import logging
 import time
 from collections.abc import Awaitable, Callable, Generator
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from itertools import chain, islice
 from pathlib import Path, PurePath
 
 from ouestcharlie_toolkit.backend import Backend
 from ouestcharlie_toolkit.lance_index import PHOTO_TABLE_NAME, LanceIndex
 from ouestcharlie_toolkit.manifest import ManifestStore
-from ouestcharlie_toolkit.partition_summary import compute_partition_summary
 from ouestcharlie_toolkit.schema import (
     METADATA_DIR,
     SCHEMA_VERSION,
@@ -78,7 +78,7 @@ class LibraryIndexResult:
 
     partitions: list[IndexResult] = field(default_factory=list)
     total_duration_ms: int = 0  # wall-clock time for the full library run
-    partitions_deleted: int = 0  # stale partitions removed from summary.json
+    partitions_deleted: int = 0  # stale partitions removed from the LanceDB index
 
     @property
     def total_photos_processed(self) -> int:
@@ -168,7 +168,6 @@ async def index_partition(
     _t0 = time.monotonic()
     result = IndexResult(partition=partition)
     xmp_store = XmpStore(backend)
-    manifest_store = ManifestStore(backend)
     if lance_index is None:
         lance_index = await LanceIndex.open(
             backend,
@@ -183,7 +182,6 @@ async def index_partition(
 
     # Hold the partition lock for the entire read → process → write cycle so
     # that no other agent can interleave writes on the same partition.
-    summary = None
     async with backend.partition_lock(partition):
         # In incremental mode, load existing photo entries from LanceDB.
         existing_by_filename: dict[str, str] = {}
@@ -287,23 +285,6 @@ async def index_partition(
             deleted_hashes = [existing_by_filename[fn] for fn in deleted_filenames]
             await lance_index.delete(partition, deleted_hashes)
 
-        if len(photo_entries) > 0 or (deleted_filenames and len(deleted_filenames) > 0):
-            summary = await compute_partition_summary(lance_index, partition)
-
-    # Update the backend-wide summary.json — separate root lock inside upsert.
-    if summary is not None:  # Prune empty partitions
-        try:
-            await manifest_store.upsert_partition_in_summary(summary)
-        except Exception as exc:
-            _log.error(
-                "Failed to update summary.json — partition=%r: %s",
-                partition,
-                exc,
-                exc_info=True,
-            )
-            result.errors += 1
-            result.error_details.append(f"summary.json update: {exc}")
-
     result.duration_ms = round((time.monotonic() - _t0) * 1000)
     return result
 
@@ -319,10 +300,11 @@ async def index_library(
     """Index all photos in a library.
 
     Walks all subdirectories under the backend root and indexes each folder
-    that directly contains photos. Each ``index_partition`` call writes both
-    the folder's ``manifest.json`` and updates the backend-wide ``summary.json``.
-    After indexing, stale partitions (present in ``summary.json`` but no longer
-    on disk) are removed from the summary and their metadata directories deleted.
+    that directly contains photos into the LanceDB index. Stale partitions
+    (previously indexed, no longer on disk) are pruned from LanceDB and their
+    metadata directories deleted. The thin ``summary.json`` marker
+    (``{schema_version, last_indexed_at}``) is written once at the end of the
+    session, not per partition.
 
     Args:
         backend: Backend to read/write.
@@ -419,13 +401,20 @@ async def index_library(
         if (p.photos_processed > 0 or p.photos_skipped > 0 or p.photos_deleted > 0 or p.errors > 0)
     )
 
-    # Remove stale partitions (in summary.json but no longer on disk).
+    # Remove stale partitions (previously indexed, no longer on disk).
     indexed_paths = {r.partition for r in partition_index_res}
     library_result.partitions_deleted = await _prune_deleted_partitions(
-        backend, manifest_store, lance_index, indexed_paths
+        backend, lance_index, indexed_paths
     )
 
     await lance_index.maintain()
+
+    # Write the thin root summary once per full indexing session (not per
+    # partition) — this is also the point where an old bulky summary.json
+    # (pre-dating this redesign) gets naturally replaced.
+    await manifest_store.write_full_summary(
+        RootSummary(schema_version=SCHEMA_VERSION, last_indexed_at=datetime.now(UTC))
+    )
 
     library_result.total_duration_ms = round((time.monotonic() - _t0) * 1000)
     return library_result
@@ -472,47 +461,32 @@ def _chunks_to_lookup(chunks: list[ThumbnailChunk]) -> dict[str, tuple[str, int]
 
 async def _prune_deleted_partitions(
     backend: Backend,
-    manifest_store: ManifestStore,
     lance_index: LanceIndex,
     indexed_paths: set[str],
 ) -> int:
-    """Remove stale partition entries from summary.json, LanceDB,
+    """Remove stale partitions (previously indexed, no longer on disk) from LanceDB.
 
-    Compares the set of discovered partitions against the existing ``summary.json``
-    and removes any partition no longer present on disk.
+    Compares the set of partitions currently present in the LanceDB index
+    against the set discovered on this indexing pass, and removes any that
+    are no longer there.
 
     Returns:
         Number of partitions removed.
     """
-    try:
-        existing_summary, version = await manifest_store.read_summary()
-    except FileNotFoundError:
-        return 0
-
-    stale = [p for p in existing_summary.partitions if p.path not in indexed_paths and p.path != ""]
+    existing_paths = await lance_index.list_partitions()
+    stale = sorted(p for p in existing_paths if p not in indexed_paths and p != "")
     if not stale:
         return 0
 
     _log.info(
         "index_library — removing %d stale partition(s): %s",
         len(stale),
-        ", ".join(sorted(p.path for p in stale)),
+        ", ".join(stale),
     )
 
-    for p in stale:
-        await _delete_partition_metadata(backend, p.path)
-        await lance_index.delete_partition(p.path)
-
-    pruned = RootSummary(
-        schema_version=existing_summary.schema_version,
-        partitions=[p for p in existing_summary.partitions if p.path in indexed_paths],
-        _extra=existing_summary._extra,
-    )
-    try:
-        async with backend.partition_lock(""):
-            await manifest_store.write_summary(pruned, version)
-    except Exception as exc:
-        _log.error("Failed to prune summary.json: %s", exc, exc_info=True)
+    for path in stale:
+        await _delete_partition_metadata(backend, path)
+        await lance_index.delete_partition(path)
 
     return len(stale)
 
