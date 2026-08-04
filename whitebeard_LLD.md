@@ -89,9 +89,9 @@ Delegated entirely to `XmpStore.read_or_create_from_picture` from `ouestcharlie_
 Called by `index_library` after the gather step. Compares the BFS-discovered partition set against the existing `summary.json`:
 
 1. Reads `summary.json` (returns 0 immediately if not found).
-2. Identifies stale partitions (in summary but not discovered by BFS).
+2. Identifies stale partitions (in lance index but not discovered by BFS).
 3. For each stale partition, calls `_delete_partition_metadata` which delegates to `backend.delete_dir()`.
-4. Writes the pruned `summary.json` via `write_summary`.
+4. Writes the `summary.json` via `write_summary`.
 
 `backend.delete_dir()` uses `shutil.rmtree` with an `onexc` callback (Python 3.12+): locked or open files are logged at WARNING and skipped rather than aborting the whole tree. Summary pruning happens regardless of deletion success — a partial cleanup is acceptable; the next library run will retry remaining files.
 
