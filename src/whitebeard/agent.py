@@ -6,7 +6,6 @@ import logging
 from datetime import UTC, datetime
 
 from mcp.server.fastmcp import Context
-from ouestcharlie_toolkit import report_progress
 from ouestcharlie_toolkit.manifest import ManifestStore
 from ouestcharlie_toolkit.schema import SCHEMA_VERSION, RootSummary
 from ouestcharlie_toolkit.server import AgentBase
@@ -172,7 +171,12 @@ class WhitebeardAgent(AgentBase):
                 photos: int = 0,
             ) -> None:
                 message = f"{name} — {photos} photos ({duration_ms}ms)" if duration_ms else name
-                await report_progress(ctx, current, total, message)
+                try:
+                    await ctx.report_progress(progress=current, total=total, message=message)
+                except Exception as exc:
+                    _log.debug(
+                        "Progress notification failed (client may have disconnected): %s", exc
+                    )
 
             try:
                 result = await index_library(
