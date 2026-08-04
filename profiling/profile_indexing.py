@@ -24,8 +24,6 @@ from pathlib import Path, PurePath
 from dotenv import dotenv_values
 from ouestcharlie_toolkit.backends.local import LocalBackend
 from ouestcharlie_toolkit.lance_index import PHOTO_TABLE_NAME, LanceIndex
-from ouestcharlie_toolkit.manifest import ManifestStore
-from ouestcharlie_toolkit.partition_summary import compute_partition_summary
 from ouestcharlie_toolkit.thumbnail_builder import generate_partition_thumbnails
 from ouestcharlie_toolkit.xmp import XmpStore
 
@@ -105,7 +103,6 @@ async def profile_steps(backend_root: str, partition: str) -> None:
     inner = LocalBackend(backend_root)
     backend = TimingBackend(inner)
     xmp_store = XmpStore(backend)
-    manifest_store = ManifestStore(backend)
     lance_index = await LanceIndex.open_or_create(backend, PHOTO_TABLE_NAME)
 
     # ── Step 1: Discovery ────────────────────────────────────────────────────
@@ -159,24 +156,7 @@ async def profile_steps(backend_root: str, partition: str) -> None:
     t_lance = time.perf_counter() - t0
     print(f"LanceDB:    {t_lance * 1000:6.1f} ms  ({len(photo_entries)} rows upserted)")
 
-    # ── Step 5: Partition summary (DuckDB over LanceDB) ──────────────────────
-    t0 = time.perf_counter()
-    summary = await compute_partition_summary(lance_index, partition)
-    t_summary_compute = time.perf_counter() - t0
-    print(f"Summary:    {t_summary_compute * 1000:6.1f} ms  (DuckDB aggregate)")
-
-    # ── Step 6: Summary.json write ───────────────────────────────────────────
-    backend.totals.clear()
-    backend.counts.clear()
-    t0 = time.perf_counter()
-    await manifest_store.upsert_partition_in_summary(summary)
-    t_summary_write = time.perf_counter() - t0
-    print(f"Summary.json:{t_summary_write * 1000:6.1f} ms")
-    print(backend.report())
-
-    total = (
-        t_discovery + t_exif_total + t_thumbnails + t_lance + t_summary_compute + t_summary_write
-    )
+    total = t_discovery + t_exif_total + t_thumbnails + t_lance
     print(f"\nTotal:      {total * 1000:6.1f} ms")
 
 
