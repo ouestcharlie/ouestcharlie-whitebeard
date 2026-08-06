@@ -3,14 +3,11 @@
 from __future__ import annotations
 
 import logging
-from datetime import UTC, datetime
 
 from mcp.server.fastmcp import Context
-from ouestcharlie_toolkit.manifest import ManifestStore
-from ouestcharlie_toolkit.schema import SCHEMA_VERSION, RootSummary
 from ouestcharlie_toolkit.server import AgentBase
 
-from .indexer import index_library, index_partition
+from .indexer import index_library, index_partition_scope
 
 _log = logging.getLogger(__name__)
 
@@ -19,7 +16,8 @@ class WhitebeardAgent(AgentBase):
     """Whitebeard: indexes an existing photo library in place.
 
     Receives ``WOOF_BACKEND_CONFIG`` from the environment (set by Woof before
-    launching), exposes one MCP tool: ``index_partition``.
+    launching), exposes MCP tools ``index_library`` and
+    ``index_partition_scope``.
     """
 
     def __init__(self) -> None:
@@ -28,95 +26,6 @@ class WhitebeardAgent(AgentBase):
 
     def _register_tools(self) -> None:
         mcp = self.mcp
-
-        @mcp.tool(name="index_partition")
-        async def index_partition_tool(
-            ctx: Context,
-            partition: str,
-            force_extract_exif: bool = False,
-            generate_thumbnails: bool = True,
-            force_full_index: bool = False,
-        ) -> dict:
-            """Index all photos directly in a partition folder.
-
-            By default runs in **incremental mode**: photos already present in
-            the leaf manifest are carried over without re-processing.  Only new
-            photos (absent from the manifest) are indexed.  Photos deleted from
-            disk are counted, logged, and removed from the updated manifest.
-
-            Scans ``partition`` for photo files (JPEG, HEIC, PNG, RAW).  For
-            each new photo (or all photos when ``force_full_index=True``),
-            extracts EXIF metadata and writes an XMP sidecar containing
-            ``ouestcharlie:contentHash`` and all standard EXIF fields.  Creates
-            or updates the leaf manifest at
-            ``<partition>/.ouestcharlie/manifest.json``.
-
-            Thumbnails: in incremental mode, a new AVIF chunk is generated for
-            new photos only and appended to the existing chunks; existing AVIF
-            files are immutable and never re-generated.
-
-            Args:
-                partition: Folder path relative to the backend root, e.g.
-                    ``""`` for the root, ``"Vacations/Italy 2023/"`` for a
-                    sub-folder.  Trailing slash is optional.
-                force_extract_exif: Re-extract EXIF and overwrite existing
-                    XMP sidecars.  Defaults to False.  Orthogonal to
-                    ``force_full_index``.
-                generate_thumbnails: Generate ``thumbnails.avif`` AVIF grids.
-                    Defaults to True.
-                force_full_index: Re-process all photos, even those already
-                    present in the manifest.  Defaults to False (incremental).
-
-            Returns:
-                ``partition`` — echoed partition path.
-                ``photosProcessed`` — photos indexed in this run (new or force-reindexed).
-                ``photosSkipped`` — photos already in the manifest, carried over.
-                ``photosDeleted`` — photos removed from disk since the last index.
-                ``sidecarsCreated`` — XMP sidecars written (new or force-updated).
-                ``sidecarsSkipped`` — photos whose existing sidecar was reused.
-                ``thumbnailsRebuilt`` — true if a new AVIF chunk was generated.
-                ``errors`` — count of photos that failed processing.
-                ``errorDetails`` — list of per-photo error messages.
-                ``durationMs`` — wall-clock time for this partition in milliseconds.
-            """
-            try:
-                result = await index_partition(
-                    self.backend,
-                    partition,
-                    force_extract_exif,
-                    generate_thumbnails=generate_thumbnails,
-                    force_full_index=force_full_index,
-                    lance_index_path=self.lance_index_path_override,
-                )
-            except Exception as exc:
-                _log.error(
-                    "index_partition failed — partition=%r: %s",
-                    partition,
-                    exc,
-                    exc_info=True,
-                )
-                raise
-
-            # This tool call is a standalone indexing session (not part of
-            # index_library's concurrent multi-partition fan-out, which
-            # writes the thin summary itself once at the end) — safe to
-            # write the thin summary.json marker once here too.
-            await ManifestStore(self.backend).write_full_summary(
-                RootSummary(schema_version=SCHEMA_VERSION, last_indexed_at=datetime.now(UTC))
-            )
-
-            return {
-                "partition": result.partition,
-                "photosProcessed": result.photos_processed,
-                "photosSkipped": result.photos_skipped,
-                "photosDeleted": result.photos_deleted,
-                "sidecarsCreated": result.sidecars_created,
-                "sidecarsSkipped": result.sidecars_skipped,
-                "thumbnailsRebuilt": result.thumbnails_rebuilt,
-                "errors": result.errors,
-                "errorDetails": result.error_details,
-                "durationMs": result.duration_ms,
-            }
 
         @mcp.tool(name="index_library")
         async def index_library_tool(
@@ -195,6 +104,91 @@ class WhitebeardAgent(AgentBase):
             return {
                 "partitionsIndexed": len(result.partitions),
                 "partitionsDeleted": result.partitions_deleted,
+                "totalPhotosProcessed": result.total_photos_processed,
+                "totalPhotosSkipped": result.total_photos_skipped,
+                "totalPhotosDeleted": result.total_photos_deleted,
+                "totalSidecarsCreated": result.total_sidecars_created,
+                "totalThumbnailsRebuilt": result.total_thumbnails_rebuilt,
+                "totalErrors": result.total_errors,
+                "topErrorDetails": list(result.top_error_details),
+                "totalDurationMs": result.total_duration_ms,
+            }
+
+        @mcp.tool(name="index_partition_scope")
+        async def index_partition_scope_tool(
+            ctx: Context,
+            partition_scope: list[str],
+            force_extract_exif: bool = False,
+            generate_thumbnails: bool = True,
+            force_full_index: bool = False,
+        ) -> dict:
+            """Index an explicit list of partition folders.
+
+            By default runs in **incremental mode**: each partition is indexed
+            incrementally (only new photos processed, deleted photos removed).
+            Use ``force_full_index=True`` to re-process all photos in every
+            listed partition.
+
+            Each entry in ``partition_scope`` is indexed independently as a
+            leaf partition (direct-child photos only, no descendants — same
+            semantics as ``index_partition``). Unlike ``index_library``, does
+            not walk the directory tree and does not prune stale partitions —
+            only the given entries are touched.
+
+            Args:
+                partition_scope: Folder paths to index, e.g.
+                    ``["2024/2024-07", "2024/2024-08"]``.
+                force_extract_exif: Re-extract EXIF and overwrite existing
+                    XMP sidecars.  Defaults to False.
+                generate_thumbnails: Generate ``thumbnails.avif`` AVIF grids
+                    for each partition.  Defaults to True.
+                force_full_index: Re-process all photos in every listed
+                    partition, even those already indexed.  Defaults to False
+                    (incremental).
+
+            Returns:
+                ``partitionsIndexed`` — number of partitions processed.
+                ``totalPhotos`` — photos indexed in this run (new or force-reindexed).
+                ``totalPhotosSkipped`` — photos carried over from existing manifests.
+                ``totalPhotosDeleted`` — photos removed from disk across all partitions.
+                ``totalSidecarsCreated`` — XMP sidecars written.
+                ``totalThumbnailsRebuilt`` — partitions where a new AVIF chunk was generated.
+                ``totalErrors`` — count of photos that failed processing.
+                ``errorDetails`` — list of per-photo error messages across all partitions.
+                ``totalDurationMs`` — wall-clock time for the run in milliseconds.
+            """
+
+            async def _scope_progress(
+                current: int,
+                total: int,
+                name: str,
+                duration_ms: int = 0,
+                photos: int = 0,
+            ) -> None:
+                message = f"{name} — {photos} photos ({duration_ms}ms)" if duration_ms else name
+                try:
+                    await ctx.report_progress(progress=current, total=total, message=message)
+                except Exception as exc:
+                    _log.debug(
+                        "Progress notification failed (client may have disconnected): %s", exc
+                    )
+
+            try:
+                result = await index_partition_scope(
+                    self.backend,
+                    partition_scope,
+                    force_extract_exif=force_extract_exif,
+                    generate_thumbnails=generate_thumbnails,
+                    force_full_index=force_full_index,
+                    on_progress=_scope_progress,
+                    lance_index_path=self.lance_index_path_override,
+                )
+            except Exception as exc:
+                cause = exc.exceptions[0] if isinstance(exc, BaseExceptionGroup) else exc
+                _log.error("index_partition_scope failed: %s", cause, exc_info=cause)
+                raise cause from exc
+            return {
+                "partitionsIndexed": len(result.partitions),
                 "totalPhotosProcessed": result.total_photos_processed,
                 "totalPhotosSkipped": result.total_photos_skipped,
                 "totalPhotosDeleted": result.total_photos_deleted,

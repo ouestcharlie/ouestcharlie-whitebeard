@@ -420,6 +420,89 @@ async def index_library(
     return library_result
 
 
+async def index_partition_scope(
+    backend: Backend,
+    partition_scope: list[str],
+    force_extract_exif: bool = False,
+    generate_thumbnails: bool = False,
+    force_full_index: bool = False,
+    on_progress: Callable[[int, int, str, int, int], Awaitable[None]] | None = None,
+    lance_index_path: Path | None = None,
+) -> LibraryIndexResult:
+    """Index an explicit list of partitions (leaf folders, direct children only).
+
+    Unlike ``index_library``, does not walk the directory tree and does not
+    prune stale partitions — only the given ``partition_scope`` entries are
+    touched, so partitions outside the scope are left untouched in LanceDB.
+
+    Args:
+        backend: Backend to read/write.
+        partition_scope: Folder paths to index. Each is indexed independently
+            via ``index_partition`` (direct children only, no descendants).
+        force_extract_exif: If True, re-extract EXIF and overwrite existing
+            XMP sidecars.  Passed through to ``index_partition``.
+        generate_thumbnails: If True, generate thumbnail AVIF containers for
+            each partition.  Passed through to ``index_partition``.
+        force_full_index: If True, re-process all photos in every partition
+            regardless of existing manifests.  Passed through to
+            ``index_partition``.
+
+    Returns:
+        LibraryIndexResult aggregating every per-partition IndexResult.
+    """
+    library_result = LibraryIndexResult()
+    manifest_store = ManifestStore(backend)
+
+    lance_index = await LanceIndex.open(
+        backend,
+        PHOTO_TABLE_NAME,
+        create_if_missing=True,
+        index_path=lance_index_path,
+    )
+
+    total_partitions = len(partition_scope)
+    semaphore = asyncio.Semaphore(_MAX_CONCURRENT_PARTITIONS)
+    completed = 0
+
+    async def _index_one(partition: str) -> IndexResult:
+        nonlocal completed
+        async with semaphore:
+            result = await index_partition(
+                backend,
+                partition,
+                force_extract_exif,
+                generate_thumbnails=generate_thumbnails,
+                force_full_index=force_full_index,
+                lance_index=lance_index,
+            )
+        completed += 1
+        if on_progress is not None:
+            await on_progress(
+                completed,
+                total_partitions,
+                partition,
+                result.duration_ms,
+                result.photos_processed + result.photos_skipped,
+            )
+        return result
+
+    _t0 = time.monotonic()
+    async with asyncio.TaskGroup() as tg:
+        tasks = [tg.create_task(_index_one(p)) for p in partition_scope]
+    library_result.partitions = [t.result() for t in tasks]
+
+    await lance_index.maintain()
+
+    # Standalone indexing session (not part of index_library's full-tree walk)
+    # — safe to write the thin summary.json marker here too.
+    await manifest_store.write_full_summary(
+        RootSummary(schema_version=SCHEMA_VERSION, last_indexed_at=datetime.now(UTC))
+    )
+
+    library_result.total_duration_ms = round((time.monotonic() - _t0) * 1000)
+    return library_result
+
+
 # ---------------------------------------------------------------------------
 # Internal helpers — single-file processing
 # ---------------------------------------------------------------------------

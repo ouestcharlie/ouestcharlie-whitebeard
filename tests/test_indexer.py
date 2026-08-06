@@ -22,6 +22,7 @@ from whitebeard.indexer import (
     LibraryIndexResult,
     index_library,
     index_partition,
+    index_partition_scope,
 )
 
 _SAMPLE_JPG = Path(__file__).parent / "sample-images" / "001.jpg"
@@ -1036,3 +1037,86 @@ async def test_index_library_partitions_deleted_count(tmpdir: Path) -> None:
     result = await index_library(backend)
 
     assert result.partitions_deleted == 2
+
+
+# ---------------------------------------------------------------------------
+# index_partition_scope — explicit multi-folder indexing
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_index_partition_scope_indexes_only_listed_partitions(tmpdir: Path) -> None:
+    """Only the given partition_scope entries are indexed, not the whole tree."""
+    (tmpdir / "2024" / "2024-07").mkdir(parents=True)
+    (tmpdir / "2024" / "2024-07" / "a.jpg").write_bytes(_MINIMAL_JPEG)
+    (tmpdir / "2024" / "2024-08").mkdir(parents=True)
+    (tmpdir / "2024" / "2024-08" / "b.jpg").write_bytes(_MINIMAL_JPEG)
+    (tmpdir / "2024" / "2024-09").mkdir(parents=True)
+    (tmpdir / "2024" / "2024-09" / "c.jpg").write_bytes(_MINIMAL_JPEG)
+    backend = LocalBackend(root=tmpdir)
+
+    result = await index_partition_scope(backend, ["2024/2024-07", "2024/2024-08"])
+
+    assert isinstance(result, LibraryIndexResult)
+    assert len(result.partitions) == 2
+    assert result.total_photos_processed == 2
+    lance_index = await LanceIndex.open(backend, PHOTO_TABLE_NAME)
+    partitions = await lance_index.list_partitions()
+    assert "2024/2024-07" in partitions
+    assert "2024/2024-08" in partitions
+    assert "2024/2024-09" not in partitions
+
+
+@pytest.mark.asyncio
+async def test_index_partition_scope_does_not_prune_out_of_scope_partitions(
+    tmpdir: Path,
+) -> None:
+    """Partitions outside the scope are left untouched, even if deleted from disk."""
+    (tmpdir / "A").mkdir()
+    (tmpdir / "A" / "p.jpg").write_bytes(_MINIMAL_JPEG)
+    (tmpdir / "B").mkdir()
+    (tmpdir / "B" / "p.jpg").write_bytes(_MINIMAL_JPEG)
+    backend = LocalBackend(root=tmpdir)
+
+    await index_library(backend)
+    shutil.rmtree(tmpdir / "B")
+
+    # Only re-index A — B is gone from disk but out of scope, so must not be pruned.
+    await index_partition_scope(backend, ["A"])
+
+    lance_index = await LanceIndex.open(backend, PHOTO_TABLE_NAME)
+    assert "B" in await lance_index.list_partitions()
+
+
+@pytest.mark.asyncio
+async def test_index_partition_scope_writes_thin_summary(tmpdir: Path) -> None:
+    """A standalone scoped run writes the thin summary.json marker, like index_partition."""
+    (tmpdir / "A").mkdir()
+    (tmpdir / "A" / "p.jpg").write_bytes(_MINIMAL_JPEG)
+    backend = LocalBackend(root=tmpdir)
+
+    await index_partition_scope(backend, ["A"])
+
+    summary, _ = await ManifestStore(backend).read_summary()
+    assert summary.schema_version == SCHEMA_VERSION
+
+
+@pytest.mark.asyncio
+async def test_index_partition_scope_progress_callback_called_for_each_partition(
+    tmpdir: Path,
+) -> None:
+    for name in ("A", "B"):
+        (tmpdir / name).mkdir()
+        (tmpdir / name / "p.jpg").write_bytes(_MINIMAL_JPEG)
+    backend = LocalBackend(root=tmpdir)
+
+    calls = []
+
+    async def on_progress(current, total, name, duration_ms, photos):
+        calls.append((current, total, name))
+
+    await index_partition_scope(backend, ["A", "B"], on_progress=on_progress)
+
+    assert len(calls) == 2
+    assert {c[2] for c in calls} == {"A", "B"}
+    assert all(c[1] == 2 for c in calls)
