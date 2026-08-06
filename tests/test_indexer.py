@@ -702,6 +702,28 @@ async def test_index_library_no_forced_reindex_when_schema_current(tmpdir: Path)
 
 
 @pytest.mark.asyncio
+async def test_index_library_raises_when_schema_newer(tmpdir: Path) -> None:
+    """When summary.json has a newer schemaVersion, index_library refuses to run."""
+    (tmpdir / "A").mkdir()
+    (tmpdir / "A" / "p.jpg").write_bytes(_MINIMAL_JPEG)
+    backend = LocalBackend(root=tmpdir)
+
+    await index_library(backend)
+
+    store = ManifestStore(backend)
+    _current_summary, version = await store.read_summary()
+    newer = RootSummary(schema_version=SCHEMA_VERSION + 1)
+    await store.write_summary(newer, version)
+
+    with pytest.raises(ValueError, match="newer"):
+        await index_library(backend)
+
+    # summary.json must be left untouched (still the newer version, not overwritten).
+    unchanged_summary, _ = await store.read_summary()
+    assert unchanged_summary.schema_version == SCHEMA_VERSION + 1
+
+
+@pytest.mark.asyncio
 async def test_index_library_progress_callback_called_for_each_partition(tmpdir: Path) -> None:
     """on_progress is called exactly once per partition."""
     for name in ("A", "B", "C"):
@@ -1054,6 +1076,7 @@ async def test_index_partition_scope_indexes_only_listed_partitions(tmpdir: Path
     (tmpdir / "2024" / "2024-09").mkdir(parents=True)
     (tmpdir / "2024" / "2024-09" / "c.jpg").write_bytes(_MINIMAL_JPEG)
     backend = LocalBackend(root=tmpdir)
+    await ManifestStore(backend).write_full_summary(RootSummary(schema_version=SCHEMA_VERSION))
 
     result = await index_partition_scope(backend, ["2024/2024-07", "2024/2024-08"])
 
@@ -1089,16 +1112,70 @@ async def test_index_partition_scope_does_not_prune_out_of_scope_partitions(
 
 
 @pytest.mark.asyncio
-async def test_index_partition_scope_writes_thin_summary(tmpdir: Path) -> None:
-    """A standalone scoped run writes the thin summary.json marker, like index_partition."""
+async def test_index_partition_scope_does_not_write_summary(tmpdir: Path) -> None:
+    """A scoped run must not write summary.json — it only checks it, never updates it."""
+    (tmpdir / "A").mkdir()
+    (tmpdir / "A" / "p.jpg").write_bytes(_MINIMAL_JPEG)
+    backend = LocalBackend(root=tmpdir)
+    store = ManifestStore(backend)
+    await store.write_full_summary(RootSummary(schema_version=SCHEMA_VERSION))
+    before, _ = await store.read_summary()
+
+    await index_partition_scope(backend, ["A"])
+
+    after, _ = await store.read_summary()
+    assert after.schema_version == before.schema_version
+    assert after.last_indexed_at == before.last_indexed_at
+
+
+@pytest.mark.asyncio
+async def test_index_partition_scope_raises_when_summary_missing(tmpdir: Path) -> None:
+    """Without a prior full index (no summary.json), scoped indexing refuses to run."""
     (tmpdir / "A").mkdir()
     (tmpdir / "A" / "p.jpg").write_bytes(_MINIMAL_JPEG)
     backend = LocalBackend(root=tmpdir)
 
-    await index_partition_scope(backend, ["A"])
+    with pytest.raises(ValueError, match="full index"):
+        await index_partition_scope(backend, ["A"])
 
-    summary, _ = await ManifestStore(backend).read_summary()
-    assert summary.schema_version == SCHEMA_VERSION
+    lance_index = await LanceIndex.open(backend, PHOTO_TABLE_NAME, create_if_missing=True)
+    assert await lance_index.list_partitions() == set()
+
+
+@pytest.mark.asyncio
+async def test_index_partition_scope_raises_when_schema_older(tmpdir: Path) -> None:
+    """A stale (older) schema version means scoped indexing must refuse and ask for a full index."""
+    (tmpdir / "A").mkdir()
+    (tmpdir / "A" / "p.jpg").write_bytes(_MINIMAL_JPEG)
+    backend = LocalBackend(root=tmpdir)
+    store = ManifestStore(backend)
+    await store.write_full_summary(RootSummary(schema_version=SCHEMA_VERSION - 1))
+
+    with pytest.raises(ValueError, match="older"):
+        await index_partition_scope(backend, ["A"])
+
+    unchanged, _ = await store.read_summary()
+    assert unchanged.schema_version == SCHEMA_VERSION - 1
+    lance_index = await LanceIndex.open(backend, PHOTO_TABLE_NAME, create_if_missing=True)
+    assert await lance_index.list_partitions() == set()
+
+
+@pytest.mark.asyncio
+async def test_index_partition_scope_raises_when_schema_newer(tmpdir: Path) -> None:
+    """A newer-than-supported schema version means scoped indexing must refuse."""
+    (tmpdir / "A").mkdir()
+    (tmpdir / "A" / "p.jpg").write_bytes(_MINIMAL_JPEG)
+    backend = LocalBackend(root=tmpdir)
+    store = ManifestStore(backend)
+    await store.write_full_summary(RootSummary(schema_version=SCHEMA_VERSION + 1))
+
+    with pytest.raises(ValueError, match="newer"):
+        await index_partition_scope(backend, ["A"])
+
+    unchanged, _ = await store.read_summary()
+    assert unchanged.schema_version == SCHEMA_VERSION + 1
+    lance_index = await LanceIndex.open(backend, PHOTO_TABLE_NAME, create_if_missing=True)
+    assert await lance_index.list_partitions() == set()
 
 
 @pytest.mark.asyncio
@@ -1109,6 +1186,7 @@ async def test_index_partition_scope_progress_callback_called_for_each_partition
         (tmpdir / name).mkdir()
         (tmpdir / name / "p.jpg").write_bytes(_MINIMAL_JPEG)
     backend = LocalBackend(root=tmpdir)
+    await ManifestStore(backend).write_full_summary(RootSummary(schema_version=SCHEMA_VERSION))
 
     calls = []
 
