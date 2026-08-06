@@ -318,6 +318,11 @@ async def index_library(
 
     Returns:
         LibraryIndexResult aggregating every per-partition IndexResult.
+
+    Raises:
+        ValueError: If the existing summary.json's schema version is newer
+            than this software's SCHEMA_VERSION (the software must be
+            upgraded before it can safely index this library).
     """
     library_result = LibraryIndexResult()
     manifest_store = ManifestStore(backend)
@@ -326,6 +331,12 @@ async def index_library(
     # reindex so all manifests and thumbnails are regenerated to the current schema.
     try:
         existing_summary, _ = await manifest_store.read_summary()
+        if existing_summary.schema_version > SCHEMA_VERSION:
+            raise ValueError(
+                f"Library index schema version {existing_summary.schema_version} is newer "
+                f"than this software supports ({SCHEMA_VERSION}). Upgrade Whitebeard before "
+                f"indexing this library."
+            )
         if existing_summary.schema_version < SCHEMA_VERSION:
             _log.info(
                 "index_library — schema version %d < %d, forcing full reindex",
@@ -335,6 +346,8 @@ async def index_library(
             force_full_index = True
     except FileNotFoundError:
         pass  # No existing index — first run, nothing to upgrade.
+    except ValueError:
+        raise
     except Exception as exc:
         _log.warning("index_library — could not read summary.json for version check: %s", exc)
 
@@ -415,6 +428,114 @@ async def index_library(
     await manifest_store.write_full_summary(
         RootSummary(schema_version=SCHEMA_VERSION, last_indexed_at=datetime.now(UTC))
     )
+
+    library_result.total_duration_ms = round((time.monotonic() - _t0) * 1000)
+    return library_result
+
+
+async def index_partition_scope(
+    backend: Backend,
+    partition_scope: list[str],
+    force_extract_exif: bool = False,
+    generate_thumbnails: bool = False,
+    force_full_index: bool = False,
+    on_progress: Callable[[int, int, str, int, int], Awaitable[None]] | None = None,
+    lance_index_path: Path | None = None,
+) -> LibraryIndexResult:
+    """Index an explicit list of partitions (leaf folders, direct children only).
+
+    Unlike ``index_library``, does not walk the directory tree and does not
+    prune stale partitions — only the given ``partition_scope`` entries are
+    touched, so partitions outside the scope are left untouched in LanceDB.
+
+    Args:
+        backend: Backend to read/write.
+        partition_scope: Folder paths to index. Each is indexed independently
+            via ``index_partition`` (direct children only, no descendants).
+        force_extract_exif: If True, re-extract EXIF and overwrite existing
+            XMP sidecars.  Passed through to ``index_partition``.
+        generate_thumbnails: If True, generate thumbnail AVIF containers for
+            each partition.  Passed through to ``index_partition``.
+        force_full_index: If True, re-process all photos in every partition
+            regardless of existing manifests.  Passed through to
+            ``index_partition``.
+
+    Requires an existing, current-schema ``summary.json`` (i.e. a prior full
+    ``index_library`` run) — a scoped run only touches a handful of leaf
+    folders, so it cannot claim to upgrade or validate the whole library's
+    schema version. It never writes ``summary.json``; it only checks the
+    existing marker and refuses to run on any mismatch.
+
+    Returns:
+        LibraryIndexResult aggregating every per-partition IndexResult.
+
+    Raises:
+        ValueError: If ``summary.json`` is missing, or its schema version
+            does not match this software's ``SCHEMA_VERSION`` (older — run a
+            full index; newer — upgrade the software).
+    """
+    library_result = LibraryIndexResult()
+    manifest_store = ManifestStore(backend)
+
+    try:
+        existing_summary, _ = await manifest_store.read_summary()
+    except FileNotFoundError as err:
+        raise ValueError(
+            "Library index not found. Run a full index before indexing a partition scope."
+        ) from err
+
+    if existing_summary.schema_version > SCHEMA_VERSION:
+        raise ValueError(
+            f"Library index schema version {existing_summary.schema_version} is newer "
+            f"than this software supports ({SCHEMA_VERSION}). Upgrade Whitebeard before "
+            f"indexing a partition scope."
+        )
+    if existing_summary.schema_version < SCHEMA_VERSION:
+        raise ValueError(
+            f"Library index schema version {existing_summary.schema_version} is older "
+            f"than the current version ({SCHEMA_VERSION}). Run a full index to upgrade "
+            f"before indexing a partition scope."
+        )
+
+    lance_index = await LanceIndex.open(
+        backend,
+        PHOTO_TABLE_NAME,
+        create_if_missing=True,
+        index_path=lance_index_path,
+    )
+
+    total_partitions = len(partition_scope)
+    semaphore = asyncio.Semaphore(_MAX_CONCURRENT_PARTITIONS)
+    completed = 0
+
+    async def _index_one(partition: str) -> IndexResult:
+        nonlocal completed
+        async with semaphore:
+            result = await index_partition(
+                backend,
+                partition,
+                force_extract_exif,
+                generate_thumbnails=generate_thumbnails,
+                force_full_index=force_full_index,
+                lance_index=lance_index,
+            )
+        completed += 1
+        if on_progress is not None:
+            await on_progress(
+                completed,
+                total_partitions,
+                partition,
+                result.duration_ms,
+                result.photos_processed + result.photos_skipped,
+            )
+        return result
+
+    _t0 = time.monotonic()
+    async with asyncio.TaskGroup() as tg:
+        tasks = [tg.create_task(_index_one(p)) for p in partition_scope]
+    library_result.partitions = [t.result() for t in tasks]
+
+    await lance_index.maintain()
 
     library_result.total_duration_ms = round((time.monotonic() - _t0) * 1000)
     return library_result
