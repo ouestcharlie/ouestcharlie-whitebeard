@@ -15,6 +15,7 @@ from ouestcharlie_toolkit.backend import Backend
 from ouestcharlie_toolkit.lance_index import PHOTO_TABLE_NAME, LanceIndex
 from ouestcharlie_toolkit.manifest import ManifestStore
 from ouestcharlie_toolkit.schema import (
+    LOWEST_SCHEMA_VERSION,
     METADATA_DIR,
     SCHEMA_VERSION,
     PhotoEntry,
@@ -25,6 +26,7 @@ from ouestcharlie_toolkit.thumbnail_builder import (
     delete_partition_thumbnails,
     generate_partition_thumbnails,
 )
+from ouestcharlie_toolkit.video import VIDEO_SUFFIXES
 from ouestcharlie_toolkit.xmp import XmpStore
 
 _log = logging.getLogger(__name__)
@@ -54,6 +56,19 @@ PHOTO_EXTENSIONS: frozenset[str] = frozenset(
         ".rw2",
     }
 )
+
+# All media extensions discovered during indexing (photos + videos). Files are
+# dispatched per-suffix inside XmpStore.read_or_create_from_picture: photos go
+# through EXIF extraction, videos (VIDEO_SUFFIXES) through container extraction.
+MEDIA_EXTENSIONS: frozenset[str] = PHOTO_EXTENSIONS | VIDEO_SUFFIXES
+
+
+def _is_video_entry(entry: PhotoEntry) -> bool:
+    """True if a PhotoEntry describes a video (media_type == "video").
+
+    ``searchable`` is keyed by FieldDef.entry_attr, so the key is ``media_type``.
+    """
+    return entry.searchable.get("media_type") == "video"
 
 
 @dataclass
@@ -176,8 +191,8 @@ async def index_partition(
             index_path=lance_index_path,
         )
 
-    # List only direct-child photo files — read-only, no lock needed.
-    photo_files = await backend.list_files(partition, PHOTO_EXTENSIONS)
+    # List only direct-child media files (photos + videos) — read-only, no lock needed.
+    photo_files = await backend.list_files(partition, MEDIA_EXTENSIONS)
     disk_filenames: set[str] = {PurePath(f.path).name for f in photo_files}
 
     # Hold the partition lock for the entire read → process → write cycle so
@@ -234,6 +249,12 @@ async def index_partition(
         # Collect new entries for thumbnail purposes (photos not previously in the index).
         new_entries = [e for e in photo_entries if e.filename not in existing_by_filename]
 
+        # Videos are indexed (searchable/browsable) but excluded from the AVIF
+        # thumbnail grid: image-proc decodes still images, not video containers.
+        # Cover-frame thumbnails for videos are a follow-up (#39 §4, thumbnail_builder).
+        photo_only_entries = [e for e in photo_entries if not _is_video_entry(e)]
+        new_photo_entries = [e for e in new_entries if not _is_video_entry(e)]
+
         # Generate thumbnail AVIF container.
         # Thumbnails are content-addressed (write_new), so no lock conflict.
         # Full mode: regenerate for all photos.
@@ -243,10 +264,10 @@ async def index_partition(
         if generate_thumbnails:
             if force_full_index:
                 await delete_partition_thumbnails(backend, partition)
-                if photo_entries:
+                if photo_only_entries:
                     try:
                         new_chunks = await generate_partition_thumbnails(
-                            backend, partition, photo_entries, tier="thumbnail"
+                            backend, partition, photo_only_entries, tier="thumbnail"
                         )
                         result.thumbnails_rebuilt = True
                         thumbnail_lookup = _chunks_to_lookup(new_chunks)
@@ -259,10 +280,10 @@ async def index_partition(
                         )
                         result.errors += 1
                         result.error_details.append(f"thumbnails: {exc}")
-            elif new_entries:
+            elif new_photo_entries:
                 try:
                     new_chunks = await generate_partition_thumbnails(
-                        backend, partition, new_entries, tier="thumbnail"
+                        backend, partition, new_photo_entries, tier="thumbnail"
                     )
                     result.thumbnails_rebuilt = True
                     thumbnail_lookup = _chunks_to_lookup(new_chunks)
@@ -327,8 +348,11 @@ async def index_library(
     library_result = LibraryIndexResult()
     manifest_store = ManifestStore(backend)
 
-    # If the existing index was built with an older schema version, force a full
-    # reindex so all manifests and thumbnails are regenerated to the current schema.
+    # Schema-version handling:
+    #   > SCHEMA_VERSION           → refuse (software too old for this index).
+    #   in [LOWEST, SCHEMA_VERSION] → use in place; additive migrations cover the gap.
+    #   < LOWEST_SCHEMA_VERSION     → too old to migrate in place; force a full reindex
+    #                                 so all manifests and thumbnails are regenerated.
     try:
         existing_summary, _ = await manifest_store.read_summary()
         if existing_summary.schema_version > SCHEMA_VERSION:
@@ -337,11 +361,11 @@ async def index_library(
                 f"than this software supports ({SCHEMA_VERSION}). Upgrade Whitebeard before "
                 f"indexing this library."
             )
-        if existing_summary.schema_version < SCHEMA_VERSION:
+        if existing_summary.schema_version < LOWEST_SCHEMA_VERSION:
             _log.info(
-                "index_library — schema version %d < %d, forcing full reindex",
+                "index_library — schema version %d < lowest supported %d, forcing full reindex",
                 existing_summary.schema_version,
-                SCHEMA_VERSION,
+                LOWEST_SCHEMA_VERSION,
             )
             force_full_index = True
     except FileNotFoundError:
@@ -484,17 +508,19 @@ async def index_partition_scope(
             "Library index not found. Run a full index before indexing a partition scope."
         ) from err
 
+    # A scoped run only touches a few leaf folders, so it cannot rebuild the
+    # library: it accepts only the compatible window and refuses anything else.
     if existing_summary.schema_version > SCHEMA_VERSION:
         raise ValueError(
             f"Library index schema version {existing_summary.schema_version} is newer "
             f"than this software supports ({SCHEMA_VERSION}). Upgrade Whitebeard before "
             f"indexing a partition scope."
         )
-    if existing_summary.schema_version < SCHEMA_VERSION:
+    if existing_summary.schema_version < LOWEST_SCHEMA_VERSION:
         raise ValueError(
             f"Library index schema version {existing_summary.schema_version} is older "
-            f"than the current version ({SCHEMA_VERSION}). Run a full index to upgrade "
-            f"before indexing a partition scope."
+            f"than the lowest supported version ({LOWEST_SCHEMA_VERSION}). Run a full "
+            f"index to upgrade before indexing a partition scope."
         )
 
     lance_index = await LanceIndex.open(
