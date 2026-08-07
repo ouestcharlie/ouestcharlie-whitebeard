@@ -158,19 +158,23 @@ async def test_index_video_lance_row(backend_with_video: LocalBackend) -> None:
 
 
 @pytest.mark.asyncio
-async def test_index_video_excluded_from_thumbnails(
+async def test_index_video_cover_frame_thumbnail(
     backend_with_video: LocalBackend, tmpdir: Path
 ) -> None:
-    """Video-only partition: thumbnail generation runs without error and makes no AVIF."""
+    """Video-only partition: the cover frame is tiled into an AVIF thumbnail chunk."""
     result = await index_partition(backend_with_video, "", generate_thumbnails=True)
     assert result.errors == 0
-    # Videos don't flow through the AVIF grid yet, so no thumbnail chunk is written.
-    assert not list((tmpdir / ".ouestcharlie").glob("thumbnails-*.avif"))
+    assert result.thumbnails_rebuilt
+    assert list((tmpdir / ".ouestcharlie").glob("thumbnails-*.avif"))
+    # The video row carries the tile location, like a photo.
+    lance_index = await LanceIndex.open(backend_with_video, PHOTO_TABLE_NAME)
+    rows = [r async for r in lance_index.get_partition_rows("")]
+    assert rows[0]["thumbnail_avif_hash"] is not None
 
 
 @pytest.mark.asyncio
 async def test_index_mixed_photo_and_video(backend_with_sample: LocalBackend, tmpdir: Path) -> None:
-    """A partition with both a photo and a video indexes both; thumbnails cover the photo."""
+    """A partition with both a photo and a video indexes and thumbnails both."""
     _write_sample_video(tmpdir / "clip.mp4")
     result = await index_partition(backend_with_sample, "", generate_thumbnails=True)
     assert result.errors == 0
@@ -179,7 +183,8 @@ async def test_index_mixed_photo_and_video(backend_with_sample: LocalBackend, tm
     rows = [x async for x in lance_index.get_partition_rows("")]
     media = {r["filename"]: r["media_type"] for r in rows}
     assert media == {"001.jpg": "photo", "clip.mp4": "video"}
-    # The photo still produced a thumbnail chunk.
+    # Both media produced tiles (they may share one grid chunk).
+    assert all(r["thumbnail_avif_hash"] is not None for r in rows)
     assert list((tmpdir / ".ouestcharlie").glob("thumbnails-*.avif"))
 
 

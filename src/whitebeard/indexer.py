@@ -63,14 +63,6 @@ PHOTO_EXTENSIONS: frozenset[str] = frozenset(
 MEDIA_EXTENSIONS: frozenset[str] = PHOTO_EXTENSIONS | VIDEO_SUFFIXES
 
 
-def _is_video_entry(entry: PhotoEntry) -> bool:
-    """True if a PhotoEntry describes a video (media_type == "video").
-
-    ``searchable`` is keyed by FieldDef.entry_attr, so the key is ``media_type``.
-    """
-    return entry.searchable.get("media_type") == "video"
-
-
 @dataclass
 class IndexResult:
     """Result of indexing a single partition."""
@@ -246,14 +238,10 @@ async def index_partition(
             else:
                 result.photos_skipped += 1
 
-        # Collect new entries for thumbnail purposes (photos not previously in the index).
+        # Collect new entries for thumbnail purposes (media not previously in the index).
+        # Videos are included: the thumbnail builder decodes each video's cover
+        # frame and tiles it into the AVIF grid like any photo.
         new_entries = [e for e in photo_entries if e.filename not in existing_by_filename]
-
-        # Videos are indexed (searchable/browsable) but excluded from the AVIF
-        # thumbnail grid: image-proc decodes still images, not video containers.
-        # Cover-frame thumbnails for videos are a follow-up (#39 §4, thumbnail_builder).
-        photo_only_entries = [e for e in photo_entries if not _is_video_entry(e)]
-        new_photo_entries = [e for e in new_entries if not _is_video_entry(e)]
 
         # Generate thumbnail AVIF container.
         # Thumbnails are content-addressed (write_new), so no lock conflict.
@@ -264,10 +252,10 @@ async def index_partition(
         if generate_thumbnails:
             if force_full_index:
                 await delete_partition_thumbnails(backend, partition)
-                if photo_only_entries:
+                if photo_entries:
                     try:
                         new_chunks = await generate_partition_thumbnails(
-                            backend, partition, photo_only_entries, tier="thumbnail"
+                            backend, partition, photo_entries, tier="thumbnail"
                         )
                         result.thumbnails_rebuilt = True
                         thumbnail_lookup = _chunks_to_lookup(new_chunks)
@@ -280,10 +268,10 @@ async def index_partition(
                         )
                         result.errors += 1
                         result.error_details.append(f"thumbnails: {exc}")
-            elif new_photo_entries:
+            elif new_entries:
                 try:
                     new_chunks = await generate_partition_thumbnails(
-                        backend, partition, new_photo_entries, tier="thumbnail"
+                        backend, partition, new_entries, tier="thumbnail"
                     )
                     result.thumbnails_rebuilt = True
                     thumbnail_lookup = _chunks_to_lookup(new_chunks)
