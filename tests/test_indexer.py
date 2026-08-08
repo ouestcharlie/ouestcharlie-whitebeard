@@ -13,7 +13,7 @@ import pytest
 from ouestcharlie_toolkit.backends.local import LocalBackend
 from ouestcharlie_toolkit.lance_index import PHOTO_TABLE_NAME, LanceIndex
 from ouestcharlie_toolkit.manifest import ManifestStore
-from ouestcharlie_toolkit.schema import SCHEMA_VERSION, RootSummary
+from ouestcharlie_toolkit.schema import LOWEST_SCHEMA_VERSION, SCHEMA_VERSION, RootSummary
 from ouestcharlie_toolkit.xmp import parse_xmp
 
 from whitebeard.indexer import (
@@ -57,6 +57,28 @@ def backend_with_sample(tmpdir: Path) -> LocalBackend:
 def backend_with_minimal(tmpdir: Path) -> LocalBackend:
     """Backend rooted at a temp dir that contains a minimal JPEG (no EXIF)."""
     (tmpdir / "photo.jpg").write_bytes(_MINIMAL_JPEG)
+    return LocalBackend(root=tmpdir)
+
+
+def _write_sample_video(path: Path, *, frames: int = 15) -> None:
+    """Synthesize a tiny mpeg4 MP4 for tests (mpeg4 ships in every ffmpeg build)."""
+    import av
+    from PIL import Image as PILImage
+
+    with av.open(str(path), "w") as container:
+        vstream = container.add_stream("mpeg4", rate=30)
+        vstream.width, vstream.height = 64, 48
+        vstream.pix_fmt = "yuv420p"
+        for i in range(frames):
+            img = PILImage.new("RGB", (64, 48), ((i * 15) % 256, 40, 90))
+            container.mux(vstream.encode(av.VideoFrame.from_image(img)))
+        container.mux(vstream.encode())
+
+
+@pytest.fixture()
+def backend_with_video(tmpdir: Path) -> LocalBackend:
+    """Backend rooted at a temp dir that contains one MP4 video."""
+    _write_sample_video(tmpdir / "clip.mp4")
     return LocalBackend(root=tmpdir)
 
 
@@ -109,6 +131,61 @@ async def test_index_manifest_photo_entry(backend_with_sample: LocalBackend) -> 
     assert len(rows) == 1
     assert rows[0]["filename"] == "001.jpg"
     assert len(rows[0]["content_hash"]) == 22
+
+
+@pytest.mark.asyncio
+async def test_index_video_creates_sidecar_with_media_type(
+    backend_with_video: LocalBackend, tmpdir: Path
+) -> None:
+    """A video file is discovered and gets a sidecar marked media_type=video."""
+    await index_partition(backend_with_video, "")
+    sidecar = parse_xmp((tmpdir / "clip.mp4.xmp").read_text(encoding="utf-8"))
+    assert sidecar.media_type == "video"
+    assert sidecar.video_codec == "mpeg4"
+    assert sidecar.duration_seconds is not None
+    assert len(sidecar.content_hash) == 22
+
+
+@pytest.mark.asyncio
+async def test_index_video_lance_row(backend_with_video: LocalBackend) -> None:
+    """The video is indexed into LanceDB with mediaType surfaced as a searchable field."""
+    await index_partition(backend_with_video, "")
+    lance_index = await LanceIndex.open(backend_with_video, PHOTO_TABLE_NAME)
+    rows = [r async for r in lance_index.get_partition_rows("")]
+    assert len(rows) == 1
+    assert rows[0]["filename"] == "clip.mp4"
+    assert rows[0]["media_type"] == "video"
+
+
+@pytest.mark.asyncio
+async def test_index_video_cover_frame_thumbnail(
+    backend_with_video: LocalBackend, tmpdir: Path
+) -> None:
+    """Video-only partition: the cover frame is tiled into an AVIF thumbnail chunk."""
+    result = await index_partition(backend_with_video, "", generate_thumbnails=True)
+    assert result.errors == 0
+    assert result.thumbnails_rebuilt
+    assert list((tmpdir / ".ouestcharlie").glob("thumbnails-*.avif"))
+    # The video row carries the tile location, like a photo.
+    lance_index = await LanceIndex.open(backend_with_video, PHOTO_TABLE_NAME)
+    rows = [r async for r in lance_index.get_partition_rows("")]
+    assert rows[0]["thumbnail_avif_hash"] is not None
+
+
+@pytest.mark.asyncio
+async def test_index_mixed_photo_and_video(backend_with_sample: LocalBackend, tmpdir: Path) -> None:
+    """A partition with both a photo and a video indexes and thumbnails both."""
+    _write_sample_video(tmpdir / "clip.mp4")
+    result = await index_partition(backend_with_sample, "", generate_thumbnails=True)
+    assert result.errors == 0
+    assert result.photos_processed == 2
+    lance_index = await LanceIndex.open(backend_with_sample, PHOTO_TABLE_NAME)
+    rows = [x async for x in lance_index.get_partition_rows("")]
+    media = {r["filename"]: r["media_type"] for r in rows}
+    assert media == {"001.jpg": "photo", "clip.mp4": "video"}
+    # Both media produced tiles (they may share one grid chunk).
+    assert all(r["thumbnail_avif_hash"] is not None for r in rows)
+    assert list((tmpdir / ".ouestcharlie").glob("thumbnails-*.avif"))
 
 
 @pytest.mark.asyncio
@@ -674,10 +751,10 @@ async def test_index_library_forces_full_reindex_on_schema_upgrade(tmpdir: Path)
     # First index — creates manifests with the current SCHEMA_VERSION.
     await index_library(backend)
 
-    # Downgrade the summary schema version to simulate an old index.
+    # Downgrade below the lowest supported version to simulate a too-old index.
     store = ManifestStore(backend)
     _current_summary, version = await store.read_summary()
-    stale = RootSummary(schema_version=SCHEMA_VERSION - 1)
+    stale = RootSummary(schema_version=LOWEST_SCHEMA_VERSION - 1)
     await store.write_summary(stale, version)
 
     # Second run (incremental by default) — must detect stale version and force full reindex.
@@ -685,6 +762,29 @@ async def test_index_library_forces_full_reindex_on_schema_upgrade(tmpdir: Path)
 
     assert result.total_photos_processed > 0  # all photos re-processed, none skipped
     assert result.total_photos_skipped == 0
+
+
+@pytest.mark.asyncio
+async def test_index_library_no_reindex_within_compatible_window(tmpdir: Path) -> None:
+    """A version within [LOWEST, SCHEMA_VERSION) is used in place — no forced reindex."""
+    (tmpdir / "A").mkdir()
+    (tmpdir / "A" / "p.jpg").write_bytes(_MINIMAL_JPEG)
+    backend = LocalBackend(root=tmpdir)
+
+    await index_library(backend)
+
+    # Simulate an index one version behind but still within the compatible window.
+    store = ManifestStore(backend)
+    _current, version = await store.read_summary()
+    await store.write_summary(RootSummary(schema_version=LOWEST_SCHEMA_VERSION), version)
+
+    result = await index_library(backend)  # must stay incremental, not full-reindex
+
+    assert result.total_photos_processed == 0
+    assert result.total_photos_skipped > 0
+    # A successful run rewrites the summary to the current version.
+    after, _ = await store.read_summary()
+    assert after.schema_version == SCHEMA_VERSION
 
 
 @pytest.mark.asyncio
@@ -1143,21 +1243,38 @@ async def test_index_partition_scope_raises_when_summary_missing(tmpdir: Path) -
 
 
 @pytest.mark.asyncio
-async def test_index_partition_scope_raises_when_schema_older(tmpdir: Path) -> None:
-    """A stale (older) schema version means scoped indexing must refuse and ask for a full index."""
+async def test_index_partition_scope_raises_when_schema_too_old(tmpdir: Path) -> None:
+    """A version below the lowest supported means scoped indexing must refuse."""
     (tmpdir / "A").mkdir()
     (tmpdir / "A" / "p.jpg").write_bytes(_MINIMAL_JPEG)
     backend = LocalBackend(root=tmpdir)
     store = ManifestStore(backend)
-    await store.write_full_summary(RootSummary(schema_version=SCHEMA_VERSION - 1))
+    await store.write_full_summary(RootSummary(schema_version=LOWEST_SCHEMA_VERSION - 1))
 
     with pytest.raises(ValueError, match="older"):
         await index_partition_scope(backend, ["A"])
 
     unchanged, _ = await store.read_summary()
-    assert unchanged.schema_version == SCHEMA_VERSION - 1
+    assert unchanged.schema_version == LOWEST_SCHEMA_VERSION - 1
     lance_index = await LanceIndex.open(backend, PHOTO_TABLE_NAME, create_if_missing=True)
     assert await lance_index.list_partitions() == set()
+
+
+@pytest.mark.asyncio
+async def test_index_partition_scope_accepts_compatible_window(tmpdir: Path) -> None:
+    """A version within [LOWEST, SCHEMA_VERSION] is accepted by a scoped run."""
+    (tmpdir / "A").mkdir()
+    (tmpdir / "A" / "p.jpg").write_bytes(_MINIMAL_JPEG)
+    backend = LocalBackend(root=tmpdir)
+    await index_library(backend)  # establishes a real index + manifests
+
+    # Downgrade the marker to the lowest supported version — still in the window.
+    store = ManifestStore(backend)
+    _current, version = await store.read_summary()
+    await store.write_summary(RootSummary(schema_version=LOWEST_SCHEMA_VERSION), version)
+
+    result = await index_partition_scope(backend, ["A"])  # must not raise
+    assert result.partitions
 
 
 @pytest.mark.asyncio
