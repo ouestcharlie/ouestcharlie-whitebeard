@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 
 from mcp.server.fastmcp import Context
+from ouestcharlie_toolkit.schema import METADATA_DIR
 from ouestcharlie_toolkit.server import AgentBase
 
 from .indexer import index_library, index_partition_scope
@@ -16,8 +17,7 @@ class WhitebeardAgent(AgentBase):
     """Whitebeard: indexes an existing photo library in place.
 
     Receives ``WOOF_BACKEND_CONFIG`` from the environment (set by Woof before
-    launching), exposes MCP tools ``index_library`` and
-    ``index_partition_scope``.
+    launching), exposes MCP tools for index lifecycle management.
     """
 
     def __init__(self) -> None:
@@ -198,3 +198,27 @@ class WhitebeardAgent(AgentBase):
                 "topErrorDetails": list(result.top_error_details),
                 "totalDurationMs": result.total_duration_ms,
             }
+
+        @mcp.tool(name="purge_metadata")
+        async def purge_metadata_tool(ctx: Context) -> dict:
+            """Delete the library's ``.ouestcharlie/`` metadata directory.
+
+            Removes all derived artefacts — manifests, ``summary.json``, the
+            LanceDB index, AVIF thumbnail grids, and cached previews — at the
+            backend root. XMP sidecars are never touched: they live alongside
+            the original photos, outside ``.ouestcharlie/``. Photos are never
+            touched. A subsequent ``index_library`` rebuilds everything this
+            removes.
+
+            Returns:
+                ``metadataDir`` — the directory targeted (``.ouestcharlie``).
+                ``existed`` — False if there was nothing to delete.
+            """
+            try:
+                existed = await self.backend.exists(METADATA_DIR)
+                if existed:
+                    await self.backend.delete_dir(METADATA_DIR)
+            except Exception as exc:
+                _log.error("purge_metadata failed: %s", exc, exc_info=exc)
+                raise
+            return {"metadataDir": METADATA_DIR, "existed": existed}
