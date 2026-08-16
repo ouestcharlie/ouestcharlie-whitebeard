@@ -993,6 +993,28 @@ async def test_force_full_index_reprocesses_all_photos(tmpdir: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_force_full_index_removes_deleted_photos_from_index(tmpdir: Path) -> None:
+    """force_full_index=True must also remove photos deleted from disk from the index."""
+    (tmpdir / "keep.jpg").write_bytes(_unique_jpeg(0))
+    (tmpdir / "delete.jpg").write_bytes(_unique_jpeg(1))
+    backend = LocalBackend(root=tmpdir)
+
+    await index_partition(backend, "")  # first run, both indexed
+
+    (tmpdir / "delete.jpg").unlink()
+
+    result = await index_partition(backend, "", force_full_index=True)
+
+    assert result.photos_deleted == 1
+
+    lance_index_obj = await LanceIndex.open(backend, PHOTO_TABLE_NAME)
+    rows = [r async for r in lance_index_obj.get_partition_rows("")]
+    filenames = {r["filename"] for r in rows}
+    assert "keep.jpg" in filenames
+    assert "delete.jpg" not in filenames
+
+
+@pytest.mark.asyncio
 async def test_index_library_incremental_skips_already_indexed(tmpdir: Path) -> None:
     """Second library run in incremental mode skips already-indexed photos."""
     (tmpdir / "A").mkdir()

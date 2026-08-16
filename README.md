@@ -50,9 +50,11 @@ uv sync
 
 ## Incremental vs Force Indexing
 
-By default, both `index_partition_scope` and `index_library` run in **incremental mode**: photos already present in the partition manifest are carried over without re-processing. Only photos missing from the manifest are indexed. Photos deleted from disk are automatically removed from the manifest on the next run.
+By default, both `index_partition_scope` and `index_library` run in **incremental mode**: photos already present in the index are carried over without re-processing. Only photos missing from the manifest are indexed.
 
 To re-process all photos regardless of their manifest state, pass `force_full_index=True`. To also regenerate XMP sidecars specifically, add `force_extract_exif=True`.
+
+Photos deleted from disk are automatically removed from the index on the next run, in both incremental and full-index mode.
 
 ## MCP Inspector
 
