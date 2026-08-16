@@ -22,9 +22,9 @@ src/whitebeard/
 Indexes all photos directly in one folder (direct children only — subdirectories are separate partitions).
 
 **Steps:**
-1. Fetch existing LanceDB rows for the partition (`filename` + `content_hash` only) to build the incremental skip map.
+1. Fetch existing LanceDB rows for the partition (`filename` + `content_hash` only) — used both to build the incremental skip map and to detect deletions. 
 2. List photo files on disk via `backend.list_files`.
-3. Detect photos in the index but no longer on disk — log and schedule for deletion.
+3. Detect photos in the index but no longer on disk — log and schedule for deletion. Runs unconditionally, in both incremental and full-reindex mode.
 4. For each photo: if already indexed and `force_full_index=False`, skip (incremental). Otherwise read or create XMP sidecar. If `force_extract_exif=True`, re-extract and overwrite.
 5. If `generate_thumbnails=True` and there are new photos, generate AVIF chunks for newly-processed photos only (or all when `force_full_index=True`).
 6. Delete stale rows from the index; write all current entries in LanceIndex (preserving existing thumbnail data for unchanged photos).
@@ -50,7 +50,7 @@ Indexes the entire library under the backend root.
 
 Whitebeard defaults to incremental mode — photos already present in the LanceDB index are skipped without re-reading their XMP sidecars or re-extracting EXIF. Only new photos (filenames not in the index) are processed.
 
-- **Deleted photos**: photos in the LanceDB index but not on disk are deleted and logged at INFO level.
+- **Deleted photos**: photos in the LanceDB index but not on disk are deleted and logged at INFO level. This applies in both incremental and full-reindex (`force_full_index=True`) mode — deletion detection is not conditional on the incremental/full distinction, which only affects whether already-indexed photos get re-processed.
 - **Deleted partitions**: partitions in `summary.json` but no longer on disk are removed from the summary, their LanceDB rows deleted, and their `.ouestcharlie/<partition>/` directories deleted after the gather step in `index_library`.
 - **EXIF changes**: changes to EXIF fields in an already-indexed photo are NOT detected in incremental mode. Use `force_extract_exif=True` together with `force_full_index=True` to refresh all metadata.
 - **Thumbnail strategy**: new AVIF chunks are generated only for newly-processed photos. `LanceIndex.upsert_partition` preserves existing thumbnail data for photos not included in the new thumbnail generation pass. `force_full_index=True` re-generates all thumbnail chunks for the partition.

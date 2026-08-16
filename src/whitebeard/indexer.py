@@ -132,14 +132,14 @@ async def index_partition(
     By default (``force_full_index=False``) runs in incremental mode: photos
     already present in the leaf manifest are carried over without re-processing.
     Only photos absent from the manifest (new arrivals) go through
-    ``_extract_one``.  Photos present in the previous manifest but no longer on
-    disk are counted, logged, and naturally removed from the updated manifest.
+    ``_extract_one``.
 
     With ``force_full_index=True`` all photos are re-processed regardless of
     the existing manifest, matching the previous unconditional behaviour.
 
-    Photos in the existing manifest that are no longer on disk are detected
-    and logged; they are removed from the updated manifest.
+    Regardless of mode, photos present in the existing index but no longer on
+    disk are always detected, logged, and removed — deletion detection is not
+    conditional on ``force_full_index``.
 
     Thumbnails are generated incrementally: a new AVIF chunk is appended for
     newly-processed photos only; existing chunks in the manifest are preserved.
@@ -190,25 +190,23 @@ async def index_partition(
     # Hold the partition lock for the entire read → process → write cycle so
     # that no other agent can interleave writes on the same partition.
     async with backend.partition_lock(partition):
-        # In incremental mode, load existing photo entries from LanceDB.
+        # Load existing photo entries from LanceDB — needed both to skip
+        # already-indexed photos in incremental mode, and to detect photos
+        # deleted from disk (in every mode, including force_full_index=True).
         existing_by_filename: dict[str, str] = {}
-        deleted_filenames: set[str] | None = None
-        if not force_full_index:
-            existing_by_filename: dict[str, str] = {}
-            async for row in lance_index.get_partition_rows(
-                partition, columns=["filename", "content_hash"]
-            ):
-                existing_by_filename[row["filename"]] = row["content_hash"]
-            deleted_filenames = existing_by_filename.keys() - disk_filenames
-            result.photos_deleted = len(deleted_filenames)
-            if deleted_filenames:
-                _log.info(
-                    "Incremental index — %d photo(s) removed from disk since last index"
-                    " — partition=%r: %s",
-                    len(deleted_filenames),
-                    partition,
-                    ", ".join(sorted(deleted_filenames)),
-                )
+        async for row in lance_index.get_partition_rows(
+            partition, columns=["filename", "content_hash"]
+        ):
+            existing_by_filename[row["filename"]] = row["content_hash"]
+        deleted_filenames = existing_by_filename.keys() - disk_filenames
+        result.photos_deleted = len(deleted_filenames)
+        if deleted_filenames:
+            _log.info(
+                "Index — %d photo(s) removed from disk since last index — partition=%r: %s",
+                len(deleted_filenames),
+                partition,
+                ", ".join(sorted(deleted_filenames)),
+            )
 
         photo_entries: list[PhotoEntry] = []
 

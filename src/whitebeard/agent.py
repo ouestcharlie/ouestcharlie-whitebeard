@@ -37,9 +37,12 @@ class WhitebeardAgent(AgentBase):
             """Recursively index all photos in the library and build manifests.
 
             By default runs in **incremental mode**: each partition is indexed
-            incrementally (only new photos processed, deleted photos removed).
-            Use ``force_full_index=True`` to re-process all photos across the
-            entire library.
+            incrementally — only new photos are processed; already-indexed
+            photos are skipped. Use ``force_full_index=True`` to re-process
+            all photos across the entire library, regardless of manifest
+            state. Photos deleted from disk since the last run are always
+            detected and removed from the index, in both incremental and
+            full-index modes.
 
             Walks every subfolder under the backend root, indexes each folder
             that contains photos as a leaf partition (creating XMP sidecars and
@@ -125,9 +128,12 @@ class WhitebeardAgent(AgentBase):
             """Index an explicit list of partition folders.
 
             By default runs in **incremental mode**: each partition is indexed
-            incrementally (only new photos processed, deleted photos removed).
-            Use ``force_full_index=True`` to re-process all photos in every
-            listed partition.
+            incrementally — only new photos are processed; already-indexed
+            photos are skipped. Use ``force_full_index=True`` to re-process
+            all photos in every listed partition, regardless of manifest
+            state. Photos deleted from disk since the last run are always
+            detected and removed from the index, in both incremental and
+            full-index modes.
 
             Each entry in ``partition_scope`` is indexed independently as a
             leaf partition (direct-child photos only, no descendants — same
