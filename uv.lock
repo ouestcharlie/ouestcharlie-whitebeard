@@ -612,7 +612,7 @@ wheels = [
 
 [[package]]
 name = "ouestcharlie-py-toolkit"
-version = "0.14.1"
+version = "0.15.0"
 source = { editable = "../ouestcharlie-py-toolkit" }
 dependencies = [
     { name = "av" },
@@ -655,7 +655,7 @@ dev = [
 
 [[package]]
 name = "ouestcharlie-whitebeard"
-version = "0.14.2"
+version = "0.15.0"
 source = { editable = "." }
 dependencies = [
     { name = "mcp" },
