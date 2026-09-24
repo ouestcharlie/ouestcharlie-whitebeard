@@ -4,7 +4,7 @@ Whitebeard is the **indexing agent** for OuEstCharlie. It operates in **index mo
 scan an existing local photo library in place (no files moved), create XMP sidecars
 with `ouestcharlie:` fields, and write leaf manifests.
 
-> **More about OuEstCharlie on the [OuEstCharlie Blog](https://ouestcharlie.github.io/ouestcharlie/)**
+> **More about OuEstCharlie on the [OuEstCharlie Blog](https://ouestcharlie.github.io)**
 
 MCP tools: `index_library` and `index_partition_scope`, both incremental by default (`force_full_index=False`).
 
