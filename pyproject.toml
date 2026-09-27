@@ -4,9 +4,9 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ouestcharlie-whitebeard"
-version = "0.15.0"
+version = "0.16.0"
 description = "OuEstCharlie Whitebeard — photo indexer agent for local drives"
-requires-python = ">=3.13"
+requires-python = ">=3.14"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE*"]
@@ -15,11 +15,12 @@ authors = [
 ]
 classifiers = [
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.14",
     "Operating System :: OS Independent",
 ]
 dependencies = [
     "mcp>=2.0,<3.0.0",
-    "ouestcharlie-py-toolkit>=0.15.0",
+    "ouestcharlie-py-toolkit>=0.16.0",
 ]
 
 [project.urls]
@@ -41,7 +42,7 @@ testpaths = ["tests"]
 tmp_path_retention_policy = "none"
 
 [tool.ruff]
-target-version = "py313"
+target-version = "py314"
 line-length = 100
 
 [tool.ruff.lint]
@@ -51,7 +52,7 @@ select = ["E", "F", "W", "I", "UP", "B", "SIM"]
 "src/whitebeard/__main__.py" = ["E402"]  # logging must be configured before whitebeard modules are imported
 
 [tool.mypy]
-python_version = "3.13"
+python_version = "3.14"
 strict = true
 
 [dependency-groups]
