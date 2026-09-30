@@ -1480,6 +1480,42 @@ async def test_index_partition_scope_indexes_only_listed_partitions(tmpdir: Path
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "bad",
+    ["2024/2024-07?", "2024-07", "missing", "2024/2024-07/a.jpg", "/2024/2024-07", "../2024"],
+)
+async def test_index_partition_scope_rejects_missing_partition(tmpdir: Path, bad: str) -> None:
+    """A scope entry that is not an existing folder fails the whole run, naming
+    the entry, before any partition is indexed."""
+    (tmpdir / "2024" / "2024-07").mkdir(parents=True)
+    (tmpdir / "2024" / "2024-07" / "a.jpg").write_bytes(_MINIMAL_JPEG)
+    backend = LocalBackend(root=tmpdir)
+    await ManifestStore(backend).write_full_summary(RootSummary(schema_version=SCHEMA_VERSION))
+
+    with pytest.raises(ValueError, match="not found") as exc_info:
+        await index_partition_scope(backend, ["2024/2024-07", bad])
+
+    listed = str(exc_info.value).split(". Paths are")[0]
+    assert listed.endswith(repr(bad))  # only the bad entry is listed
+    lance_index = await LanceIndex.open(backend, PHOTO_TABLE_NAME, create_if_missing=True)
+    assert await lance_index.list_partitions() == set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("good", ["", "2024", "2024/2024-07", "2024/2024-07/"])
+async def test_index_partition_scope_accepts_existing_partition(tmpdir: Path, good: str) -> None:
+    """The library root, a parent folder and a trailing slash are all accepted."""
+    (tmpdir / "2024" / "2024-07").mkdir(parents=True)
+    (tmpdir / "2024" / "2024-07" / "a.jpg").write_bytes(_MINIMAL_JPEG)
+    backend = LocalBackend(root=tmpdir)
+    await ManifestStore(backend).write_full_summary(RootSummary(schema_version=SCHEMA_VERSION))
+
+    result = await index_partition_scope(backend, [good])
+
+    assert len(result.partitions) == 1
+
+
+@pytest.mark.asyncio
 async def test_index_partition_scope_does_not_prune_out_of_scope_partitions(
     tmpdir: Path,
 ) -> None:

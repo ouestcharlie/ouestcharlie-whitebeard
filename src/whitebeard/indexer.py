@@ -604,7 +604,8 @@ async def index_partition_scope(
     Raises:
         ValueError: If ``summary.json`` is missing, or its schema version
             does not match this software's ``SCHEMA_VERSION`` (older — run a
-            full index; newer — upgrade the software).
+            full index; newer — upgrade the software), or if an entry of
+            ``partition_scope`` is not an existing folder of the library.
     """
     library_result = LibraryIndexResult()
     manifest_store = ManifestStore(backend)
@@ -629,6 +630,17 @@ async def index_partition_scope(
             f"Library index schema version {existing_summary.schema_version} is older "
             f"than the lowest supported version ({LOWEST_SCHEMA_VERSION}). Run a full "
             f"index to upgrade before indexing a partition scope."
+        )
+
+    # A mistyped folder would list no files and silently index nothing, so
+    # refuse the whole run before touching any partition.
+    missing = [p for p in partition_scope if not await backend.dir_exists(p)]
+    if missing:
+        raise ValueError(
+            "Partition scope folder(s) not found in the library: "
+            + ", ".join(repr(p) for p in missing)
+            + ". Paths are relative to the library root, e.g. '2024/2024-07'. "
+            "To remove deleted folders from the index, run a full index."
         )
 
     lance_index = await LanceIndex.open(
