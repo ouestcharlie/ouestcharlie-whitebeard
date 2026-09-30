@@ -141,6 +141,10 @@ async def index_partition(
     disk are always detected, logged, and removed — deletion detection is not
     conditional on ``force_full_index``.
 
+    Every run also enforces one row per ``content_hash`` and per filename:
+    rows for a replaced hash and duplicate-key rows are deleted before the
+    upsert, and identical copies share one row under a stable filename.
+
     Thumbnails are generated incrementally: a new AVIF chunk is appended for
     newly-processed photos only; existing chunks in the manifest are preserved.
     Use ``force_full_index=True`` to regenerate thumbnails from scratch.
@@ -190,15 +194,27 @@ async def index_partition(
     # Hold the partition lock for the entire read → process → write cycle so
     # that no other agent can interleave writes on the same partition.
     async with backend.partition_lock(partition):
-        # Load existing photo entries from LanceDB — needed both to skip
-        # already-indexed photos in incremental mode, and to detect photos
-        # deleted from disk (in every mode, including force_full_index=True).
-        existing_by_filename: dict[str, str] = {}
+        # Load every existing row from LanceDB — needed to skip already-indexed
+        # photos in incremental mode, to detect photos deleted from disk (in
+        # every mode), and to repair stale or duplicate rows. A filename may
+        # hold several rows (its hash changed) and a hash may hold several rows
+        # (identical copies indexed before OEC-11b), so keep them all.
+        hashes_by_filename: dict[str, set[str]] = {}
+        filenames_by_hash: dict[str, set[str]] = {}
+        rows_per_hash: dict[str, int] = {}
+        existing_thumbs: dict[str, tuple[str, int]] = {}
         async for row in lance_index.get_partition_rows(
-            partition, columns=["filename", "content_hash"]
+            partition,
+            columns=["filename", "content_hash", "thumbnail_avif_hash", "thumbnail_tile_index"],
         ):
-            existing_by_filename[row["filename"]] = row["content_hash"]
-        deleted_filenames = existing_by_filename.keys() - disk_filenames
+            fn, h = row["filename"], row["content_hash"]
+            hashes_by_filename.setdefault(fn, set()).add(h)
+            filenames_by_hash.setdefault(h, set()).add(fn)
+            rows_per_hash[h] = rows_per_hash.get(h, 0) + 1
+            avif, tile = row.get("thumbnail_avif_hash"), row.get("thumbnail_tile_index")
+            if avif is not None and tile is not None:
+                existing_thumbs[h] = (str(avif), int(tile))
+        deleted_filenames = hashes_by_filename.keys() - disk_filenames
         result.photos_deleted = len(deleted_filenames)
         if deleted_filenames:
             _log.info(
@@ -209,37 +225,138 @@ async def index_partition(
             )
 
         photo_entries: list[PhotoEntry] = []
+        path_by_filename: dict[str, str] = {}
+        attempted: set[str] = set()  # every filename passed to _process
+        failed: set[str] = set()  # filenames whose extraction raised
+
+        async def _process(photo_path: str) -> None:
+            filename = PurePath(photo_path).name
+            attempted.add(filename)
+            result.photos_processed += 1
+            try:
+                entry, created = await _extract_one(xmp_store, photo_path, force_extract_exif)
+                photo_entries.append(entry)
+                if created:
+                    result.sidecars_created += 1
+                else:
+                    result.sidecars_skipped += 1
+            except Exception as exc:
+                _log.error(
+                    "Failed to process photo — partition=%r file=%r: %s",
+                    partition,
+                    filename,
+                    exc,
+                    exc_info=True,
+                )
+                failed.add(filename)
+                result.errors += 1
+                result.error_details.append(f"{filename}: {exc}")
 
         for file_info in photo_files:
             filename = PurePath(file_info.path).name
-            if force_full_index or filename not in existing_by_filename:
-                result.photos_processed += 1
-                try:
-                    entry, created = await _extract_one(
-                        xmp_store, file_info.path, force_extract_exif
-                    )
-                    photo_entries.append(entry)
-                    if created:
-                        result.sidecars_created += 1
-                    else:
-                        result.sidecars_skipped += 1
-                except Exception as exc:
-                    _log.error(
-                        "Failed to process photo — partition=%r file=%r: %s",
-                        partition,
-                        filename,
-                        exc,
-                        exc_info=True,
-                    )
-                    result.errors += 1
-                    result.error_details.append(f"{filename}: {exc}")
+            path_by_filename[filename] = file_info.path
+            # A filename with several rows had its hash change: re-process it
+            # even in incremental mode to learn which hash is current.
+            if force_full_index or len(hashes_by_filename.get(filename, ())) != 1:
+                await _process(file_info.path)
             else:
                 result.photos_skipped += 1
 
-        # Collect new entries for thumbnail purposes (media not previously in the index).
-        # Videos are included: the thumbnail builder decodes each video's cover
-        # frame and tiles it into the AVIF grid like any photo.
-        new_entries = [e for e in photo_entries if e.filename not in existing_by_filename]
+        # Hashes whose rows must be deleted before the upsert:
+        #   - every hash of a file gone from disk;
+        #   - every hash of a duplicate merge key (two rows share one hash);
+        #   - every former hash of a re-processed file whose hash changed.
+        stale_hashes: set[str] = {h for fn in deleted_filenames for h in hashes_by_filename[fn]}
+        stale_hashes |= {h for h, n in rows_per_hash.items() if n > 1}
+
+        # A stale hash may still be held by a file skipped in incremental mode
+        # (another copy of a deleted file, or a duplicate-key row). Deleting it
+        # would drop that photo, so re-process its representative to write the
+        # row back. Extraction reuses the sidecar, so this is cheap. Loop because
+        # a re-processed file may reveal a changed hash, itself stale. Files
+        # already attempted (including failed ones) are never retried.
+        while True:
+            processed = {e.filename: e.content_hash for e in photo_entries}
+            for fn, h in processed.items():
+                stale_hashes |= hashes_by_filename.get(fn, set()) - {h}
+            held = set(processed.values())
+            backfill = {
+                min(candidates)
+                for h in stale_hashes - held
+                if (
+                    candidates := [
+                        fn
+                        for fn in filenames_by_hash.get(h, ())
+                        if fn in disk_filenames and fn not in attempted
+                    ]
+                )
+            }
+            if not backfill:
+                break
+            for fn in sorted(backfill):
+                result.photos_skipped -= 1
+                await _process(path_by_filename[fn])
+
+        # A stale hash still indexed under an on-disk file that failed
+        # extraction cannot be written back: keep its rows rather than drop the
+        # photo. A later run with a healthy read completes the repair.
+        unwritable = {
+            h
+            for h in stale_hashes - held
+            if any(fn in failed for fn in filenames_by_hash.get(h, ()))
+        }
+        if unwritable:
+            _log.warning(
+                "Keeping %d stale row hash(es) whose file failed extraction — partition=%r",
+                len(unwritable),
+                partition,
+            )
+            stale_hashes -= unwritable
+
+        # Keep the representative copy stable: when a hash is still held by a
+        # filename already indexed under it, that filename stays the row's name
+        # and the other copies are dropped. A stale hash is written back only
+        # from processed files, so its representative must be one of them.
+        # Otherwise the smallest processed filename is the representative, so
+        # upsert_partition never receives two entries with one hash.
+        # Skipped files have exactly one indexed hash, taken as current.
+        current_hash: dict[str, str] = {
+            fn: next(iter(hs))
+            for fn, hs in hashes_by_filename.items()
+            if fn in disk_filenames and len(hs) == 1
+        }
+        current_hash.update(processed)
+        representative: dict[str, str] = {}
+        for h in held:
+            incumbents = [
+                fn
+                for fn in filenames_by_hash.get(h, ())
+                if current_hash.get(fn) == h and (h not in stale_hashes or fn in processed)
+            ]
+            representative[h] = min(incumbents or (fn for fn, fh in processed.items() if fh == h))
+        kept_entries: list[PhotoEntry] = []
+        for entry in photo_entries:
+            rep = representative[entry.content_hash]
+            if rep != entry.filename:
+                _log.debug(
+                    "Identical copy of %r — partition=%r: skipping %r",
+                    rep,
+                    partition,
+                    entry.filename,
+                )
+                continue
+            kept_entries.append(entry)
+        photo_entries = kept_entries
+
+        # Collect new entries for thumbnail purposes: media not previously in the
+        # index, or re-processed with a hash never indexed (no thumbnail to carry
+        # over). Videos are included: the thumbnail builder decodes each video's
+        # cover frame and tiles it into the AVIF grid like any photo.
+        new_entries = [
+            e
+            for e in photo_entries
+            if e.filename not in hashes_by_filename or e.content_hash not in filenames_by_hash
+        ]
 
         # Generate thumbnail AVIF container.
         # Thumbnails are content-addressed (write_new), so no lock conflict.
@@ -283,14 +400,19 @@ async def index_partition(
                     result.errors += 1
                     result.error_details.append(f"thumbnails: {exc}")
 
+        # Delete stale rows before the upsert, so a hash written back by the
+        # upsert (another copy, a swapped file) is not removed afterwards.
+        # upsert_partition reads existing thumbnails after the delete, so carry
+        # the deleted hashes' thumbnails over; freshly generated ones win.
+        if stale_hashes:
+            thumbnail_lookup = {
+                h: existing_thumbs[h] for h in stale_hashes if h in existing_thumbs
+            } | thumbnail_lookup
+            await lance_index.delete(partition, sorted(stale_hashes))
+
         # Upsert all photo rows for this partition.
         if len(photo_entries) > 0:
             await lance_index.upsert_partition(partition, photo_entries, thumbnail_lookup or None)
-
-        # Delete from index photos removed from disk.
-        if deleted_filenames:
-            deleted_hashes = [existing_by_filename[fn] for fn in deleted_filenames]
-            await lance_index.delete(partition, deleted_hashes)
 
     result.duration_ms = round((time.monotonic() - _t0) * 1000)
     return result
@@ -482,7 +604,8 @@ async def index_partition_scope(
     Raises:
         ValueError: If ``summary.json`` is missing, or its schema version
             does not match this software's ``SCHEMA_VERSION`` (older — run a
-            full index; newer — upgrade the software).
+            full index; newer — upgrade the software), or if an entry of
+            ``partition_scope`` is not an existing folder of the library.
     """
     library_result = LibraryIndexResult()
     manifest_store = ManifestStore(backend)
@@ -507,6 +630,17 @@ async def index_partition_scope(
             f"Library index schema version {existing_summary.schema_version} is older "
             f"than the lowest supported version ({LOWEST_SCHEMA_VERSION}). Run a full "
             f"index to upgrade before indexing a partition scope."
+        )
+
+    # A mistyped folder would list no files and silently index nothing, so
+    # refuse the whole run before touching any partition.
+    missing = [p for p in partition_scope if not await backend.dir_exists(p)]
+    if missing:
+        raise ValueError(
+            "Partition scope folder(s) not found in the library: "
+            + ", ".join(repr(p) for p in missing)
+            + ". Paths are relative to the library root, e.g. '2024/2024-07'. "
+            "To remove deleted folders from the index, run a full index."
         )
 
     lance_index = await LanceIndex.open(
