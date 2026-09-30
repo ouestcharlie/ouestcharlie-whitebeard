@@ -1167,23 +1167,27 @@ async def test_incremental_repairs_filename_with_two_hashes(tmpdir: Path) -> Non
 
 
 @pytest.mark.asyncio
-async def test_identical_copies_single_row(tmpdir: Path) -> None:
-    """Cause B: two byte-identical files give one row, kept across re-indexes."""
+async def test_identical_copies_single_row(tmpdir: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """Cause B: two byte-identical files give one row, kept across re-indexes.
+    The indexer picks the representative itself: upsert_partition never warns."""
     (tmpdir / "IMG_0001.JPG").write_bytes(_unique_jpeg(0))
     (tmpdir / "IMG_0001_modified.JPG").write_bytes(_unique_jpeg(0))
     backend = LocalBackend(root=tmpdir)
 
-    await index_partition(backend, "")
-    assert len(await _rows(backend)) == 1
+    with caplog.at_level(logging.WARNING):
+        await index_partition(backend, "")
+        assert len(await _rows(backend)) == 1
 
-    await index_partition(backend, "", force_full_index=True)
-    rows = await _rows(backend)
-    assert len(rows) == 1
+        await index_partition(backend, "", force_full_index=True)
+        rows = await _rows(backend)
+        assert len(rows) == 1
 
-    await index_partition(backend, "")
-    rows = await _rows(backend)
-    assert len(rows) == 1
-    assert rows[0]["filename"] == "IMG_0001.JPG"
+        await index_partition(backend, "")
+        rows = await _rows(backend)
+        assert len(rows) == 1
+        assert rows[0]["filename"] == "IMG_0001.JPG"
+
+    assert not [r for r in caplog.records if "Duplicate content_hash" in r.message]
 
 
 @pytest.mark.asyncio
@@ -1287,6 +1291,81 @@ async def test_swapped_content_keeps_both_rows(tmpdir: Path) -> None:
 
     after = {r["filename"]: r["content_hash"] for r in await _rows(backend)}
     assert after == {"x.jpg": before["y.jpg"], "y.jpg": before["x.jpg"]}
+
+
+async def _failing_extract(xmp_store, photo_path, force_extract_exif):
+    raise OSError("transient read error")
+
+
+@pytest.mark.asyncio
+async def test_repair_keeps_rows_when_holder_fails_extraction(tmpdir: Path) -> None:
+    """A duplicate-key hash is not deleted when the only file holding it fails
+    extraction: nothing could write it back, and the photo would vanish."""
+    (tmpdir / "a.jpg").write_bytes(_unique_jpeg(0))
+    backend = LocalBackend(root=tmpdir)
+    await index_partition(backend, "")
+    await _seed_duplicate_row(backend, "a.jpg", "a.jpg")
+
+    with patch("whitebeard.indexer._extract_one", side_effect=_failing_extract):
+        result = await index_partition(backend, "")
+
+    assert result.errors == 1
+    assert {r["filename"] for r in await _rows(backend)} == {"a.jpg"}
+
+    # A later run with a healthy read completes the repair.
+    await index_partition(backend, "")
+    assert len(await _rows(backend)) == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_file_is_processed_once(tmpdir: Path) -> None:
+    """In full mode, a file that fails extraction and holds a stale hash is not
+    retried by the write-back loop: counts stay consistent."""
+    (tmpdir / "a.jpg").write_bytes(_unique_jpeg(0))
+    backend = LocalBackend(root=tmpdir)
+    await index_partition(backend, "")
+    await _seed_duplicate_row(backend, "a.jpg", "a.jpg")
+
+    with patch("whitebeard.indexer._extract_one", side_effect=_failing_extract):
+        result = await index_partition(backend, "", force_full_index=True)
+
+    assert result.photos_processed == 1
+    assert result.photos_skipped == 0
+    assert result.errors == 1
+    assert len(result.error_details) == 1
+
+
+@pytest.mark.asyncio
+async def test_reprocessed_file_with_new_hash_gets_thumbnail(tmpdir: Path) -> None:
+    """A re-processed, already-indexed filename whose hash is new has no
+    thumbnail to carry over, so it is passed to the thumbnail builder."""
+    (tmpdir / "photo.jpg").write_bytes(_unique_jpeg(0))
+    backend = LocalBackend(root=tmpdir)
+    await index_partition(backend, "")
+    # Leftover of cause A: a second row for the filename, under another hash.
+    (row,) = await _rows(backend)
+    idx = await LanceIndex.open(backend, PHOTO_TABLE_NAME)
+    await idx._table.add(
+        pa.Table.from_pylist([{**row, "content_hash": "old_hash"}], schema=PHOTO_SCHEMA)
+    )
+    (tmpdir / "photo.jpg").write_bytes(_unique_jpeg(1))
+
+    thumbnail_call_args: list = []
+
+    async def capturing_thumbnails(b, partition, entries, tier):
+        thumbnail_call_args.append([e.filename for e in entries])
+        return []
+
+    with patch(
+        "whitebeard.indexer.generate_partition_thumbnails",
+        side_effect=capturing_thumbnails,
+    ):
+        await index_partition(backend, "", generate_thumbnails=True, force_extract_exif=True)
+
+    assert thumbnail_call_args == [["photo.jpg"]]
+    rows = await _rows(backend)
+    assert len(rows) == 1
+    assert rows[0]["content_hash"] not in {row["content_hash"], "old_hash"}
 
 
 # ---------------------------------------------------------------------------

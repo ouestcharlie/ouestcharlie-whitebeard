@@ -226,9 +226,12 @@ async def index_partition(
 
         photo_entries: list[PhotoEntry] = []
         path_by_filename: dict[str, str] = {}
+        attempted: set[str] = set()  # every filename passed to _process
+        failed: set[str] = set()  # filenames whose extraction raised
 
         async def _process(photo_path: str) -> None:
             filename = PurePath(photo_path).name
+            attempted.add(filename)
             result.photos_processed += 1
             try:
                 entry, created = await _extract_one(xmp_store, photo_path, force_extract_exif)
@@ -245,6 +248,7 @@ async def index_partition(
                     exc,
                     exc_info=True,
                 )
+                failed.add(filename)
                 result.errors += 1
                 result.error_details.append(f"{filename}: {exc}")
 
@@ -269,8 +273,8 @@ async def index_partition(
         # (another copy of a deleted file, or a duplicate-key row). Deleting it
         # would drop that photo, so re-process its representative to write the
         # row back. Extraction reuses the sidecar, so this is cheap. Loop because
-        # a re-processed file may reveal a changed hash, itself stale.
-        attempted: set[str] = {e.filename for e in photo_entries}
+        # a re-processed file may reveal a changed hash, itself stale. Files
+        # already attempted (including failed ones) are never retried.
         while True:
             processed = {e.filename: e.content_hash for e in photo_entries}
             for fn, h in processed.items():
@@ -290,15 +294,31 @@ async def index_partition(
             if not backfill:
                 break
             for fn in sorted(backfill):
-                attempted.add(fn)
                 result.photos_skipped -= 1
                 await _process(path_by_filename[fn])
+
+        # A stale hash still indexed under an on-disk file that failed
+        # extraction cannot be written back: keep its rows rather than drop the
+        # photo. A later run with a healthy read completes the repair.
+        unwritable = {
+            h
+            for h in stale_hashes - held
+            if any(fn in failed for fn in filenames_by_hash.get(h, ()))
+        }
+        if unwritable:
+            _log.warning(
+                "Keeping %d stale row hash(es) whose file failed extraction — partition=%r",
+                len(unwritable),
+                partition,
+            )
+            stale_hashes -= unwritable
 
         # Keep the representative copy stable: when a hash is still held by a
         # filename already indexed under it, that filename stays the row's name
         # and the other copies are dropped. A stale hash is written back only
         # from processed files, so its representative must be one of them.
-        # Otherwise upsert_partition picks the smallest filename among the copies.
+        # Otherwise the smallest processed filename is the representative, so
+        # upsert_partition never receives two entries with one hash.
         # Skipped files have exactly one indexed hash, taken as current.
         current_hash: dict[str, str] = {
             fn: next(iter(hs))
@@ -313,12 +333,11 @@ async def index_partition(
                 for fn in filenames_by_hash.get(h, ())
                 if current_hash.get(fn) == h and (h not in stale_hashes or fn in processed)
             ]
-            if incumbents:
-                representative[h] = min(incumbents)
+            representative[h] = min(incumbents or (fn for fn, fh in processed.items() if fh == h))
         kept_entries: list[PhotoEntry] = []
         for entry in photo_entries:
-            rep = representative.get(entry.content_hash)
-            if rep is not None and rep != entry.filename:
+            rep = representative[entry.content_hash]
+            if rep != entry.filename:
                 _log.debug(
                     "Identical copy of %r — partition=%r: skipping %r",
                     rep,
@@ -329,10 +348,15 @@ async def index_partition(
             kept_entries.append(entry)
         photo_entries = kept_entries
 
-        # Collect new entries for thumbnail purposes (media not previously in the index).
-        # Videos are included: the thumbnail builder decodes each video's cover
-        # frame and tiles it into the AVIF grid like any photo.
-        new_entries = [e for e in photo_entries if e.filename not in hashes_by_filename]
+        # Collect new entries for thumbnail purposes: media not previously in the
+        # index, or re-processed with a hash never indexed (no thumbnail to carry
+        # over). Videos are included: the thumbnail builder decodes each video's
+        # cover frame and tiles it into the AVIF grid like any photo.
+        new_entries = [
+            e
+            for e in photo_entries
+            if e.filename not in hashes_by_filename or e.content_hash not in filenames_by_hash
+        ]
 
         # Generate thumbnail AVIF container.
         # Thumbnails are content-addressed (write_new), so no lock conflict.
