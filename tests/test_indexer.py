@@ -9,9 +9,10 @@ from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
+import pyarrow as pa
 import pytest
 from ouestcharlie_toolkit.backends.local import LocalBackend
-from ouestcharlie_toolkit.lance_index import PHOTO_TABLE_NAME, LanceIndex
+from ouestcharlie_toolkit.lance_index import PHOTO_SCHEMA, PHOTO_TABLE_NAME, LanceIndex
 from ouestcharlie_toolkit.manifest import ManifestStore
 from ouestcharlie_toolkit.schema import LOWEST_SCHEMA_VERSION, SCHEMA_VERSION, RootSummary
 from ouestcharlie_toolkit.xmp import parse_xmp
@@ -1102,6 +1103,272 @@ async def test_incremental_generates_new_thumbnail_chunk_when_photo_added(
 
 
 # ---------------------------------------------------------------------------
+# One row per (partition, content_hash) and per (partition, filename) — OEC-60
+# ---------------------------------------------------------------------------
+
+
+async def _rows(backend: LocalBackend, partition: str = "") -> list[dict]:
+    idx = await LanceIndex.open(backend, PHOTO_TABLE_NAME)
+    return [r async for r in idx.get_partition_rows(partition)]
+
+
+def _assert_unique_keys(rows: list[dict]) -> None:
+    hashes = [r["content_hash"] for r in rows]
+    filenames = [r["filename"] for r in rows]
+    assert len(hashes) == len(set(hashes)), hashes
+    assert len(filenames) == len(set(filenames)), filenames
+
+
+async def _seed_duplicate_row(backend: LocalBackend, source: str, filename: str) -> None:
+    """Append a copy of ``source``'s row named ``filename``, bypassing merge_insert,
+    to recreate a duplicate merge key as left by pre-OEC-11b indexes."""
+    idx = await LanceIndex.open(backend, PHOTO_TABLE_NAME)
+    row = next(r for r in await _rows(backend) if r["filename"] == source)
+    await idx._table.add(pa.Table.from_pylist([{**row, "filename": filename}], schema=PHOTO_SCHEMA))
+
+
+@pytest.mark.asyncio
+async def test_full_index_replaces_row_when_content_hash_changes(tmpdir: Path) -> None:
+    """Cause A: a file keeps its name but gets a new hash — one row, new hash."""
+    (tmpdir / "photo.jpg").write_bytes(_unique_jpeg(0))
+    backend = LocalBackend(root=tmpdir)
+    await index_partition(backend, "")
+    (old_hash,) = {r["content_hash"] for r in await _rows(backend)}
+
+    (tmpdir / "photo.jpg").write_bytes(_unique_jpeg(1))
+    await index_partition(backend, "", force_full_index=True, force_extract_exif=True)
+
+    rows = await _rows(backend)
+    assert len(rows) == 1
+    assert rows[0]["filename"] == "photo.jpg"
+    assert rows[0]["content_hash"] != old_hash
+
+
+@pytest.mark.asyncio
+async def test_incremental_repairs_filename_with_two_hashes(tmpdir: Path) -> None:
+    """A filename left with rows for its old and new hash is repaired by an
+    incremental run: only the current hash remains."""
+    (tmpdir / "photo.jpg").write_bytes(_unique_jpeg(0))
+    backend = LocalBackend(root=tmpdir)
+    await index_partition(backend, "")
+    (old_row,) = await _rows(backend)
+    (tmpdir / "photo.jpg").write_bytes(_unique_jpeg(1))
+    await index_partition(backend, "", force_full_index=True, force_extract_exif=True)
+    # Pre-OEC-60 behaviour: the full re-index left the old row. Recreate it.
+    idx = await LanceIndex.open(backend, PHOTO_TABLE_NAME)
+    await idx._table.add(pa.Table.from_pylist([old_row], schema=PHOTO_SCHEMA))
+    assert len(await _rows(backend)) == 2
+
+    await index_partition(backend, "")
+
+    rows = await _rows(backend)
+    assert len(rows) == 1
+    assert rows[0]["content_hash"] != old_row["content_hash"]
+
+
+@pytest.mark.asyncio
+async def test_identical_copies_single_row(tmpdir: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """Cause B: two byte-identical files give one row, kept across re-indexes.
+    The indexer picks the representative itself: upsert_partition never warns."""
+    (tmpdir / "IMG_0001.JPG").write_bytes(_unique_jpeg(0))
+    (tmpdir / "IMG_0001_modified.JPG").write_bytes(_unique_jpeg(0))
+    backend = LocalBackend(root=tmpdir)
+
+    with caplog.at_level(logging.WARNING):
+        await index_partition(backend, "")
+        assert len(await _rows(backend)) == 1
+
+        await index_partition(backend, "", force_full_index=True)
+        rows = await _rows(backend)
+        assert len(rows) == 1
+
+        await index_partition(backend, "")
+        rows = await _rows(backend)
+        assert len(rows) == 1
+        assert rows[0]["filename"] == "IMG_0001.JPG"
+
+    assert not [r for r in caplog.records if "Duplicate content_hash" in r.message]
+
+
+@pytest.mark.asyncio
+async def test_identical_copies_representative_is_stable(tmpdir: Path) -> None:
+    """Incremental runs never rename the row to the other copy."""
+    (tmpdir / "b.jpg").write_bytes(_unique_jpeg(0))
+    backend = LocalBackend(root=tmpdir)
+    await index_partition(backend, "")
+    # The copy added later sorts first, but must not take over the row.
+    (tmpdir / "a.jpg").write_bytes(_unique_jpeg(0))
+
+    for _ in range(2):
+        await index_partition(backend, "")
+        rows = await _rows(backend)
+        assert [r["filename"] for r in rows] == ["b.jpg"]
+
+
+@pytest.mark.asyncio
+async def test_repairs_duplicate_key_rows(tmpdir: Path) -> None:
+    """Two rows with the same (partition, content_hash) collapse to one."""
+    (tmpdir / "a.jpg").write_bytes(_unique_jpeg(0))
+    (tmpdir / "b.jpg").write_bytes(_unique_jpeg(0))
+    (tmpdir / "other.jpg").write_bytes(_unique_jpeg(1))
+    backend = LocalBackend(root=tmpdir)
+    await index_partition(backend, "")
+    await _seed_duplicate_row(backend, "a.jpg", "b.jpg")
+    await _seed_duplicate_row(backend, "other.jpg", "other.jpg")
+    assert len(await _rows(backend)) == 4
+
+    await index_partition(backend, "")
+
+    rows = await _rows(backend)
+    _assert_unique_keys(rows)
+    assert sorted(r["filename"] for r in rows) == ["a.jpg", "other.jpg"]
+
+
+@pytest.mark.asyncio
+async def test_repair_preserves_thumbnail_reference(tmpdir: Path) -> None:
+    """A row deleted and written back keeps its thumbnail reference."""
+    (tmpdir / "a.jpg").write_bytes(_unique_jpeg(0))
+    backend = LocalBackend(root=tmpdir)
+    await index_partition(backend, "")
+    idx = await LanceIndex.open(backend, PHOTO_TABLE_NAME)
+    (row,) = await _rows(backend)
+    await idx._table.delete("filename = 'a.jpg'")
+    thumbed = {**row, "thumbnail_avif_hash": "avif123", "thumbnail_tile_index": 3}
+    await idx._table.add(pa.Table.from_pylist([thumbed, thumbed], schema=PHOTO_SCHEMA))
+
+    await index_partition(backend, "")
+
+    rows = await _rows(backend)
+    assert len(rows) == 1
+    assert rows[0]["thumbnail_avif_hash"] == "avif123"
+    assert rows[0]["thumbnail_tile_index"] == 3
+
+
+@pytest.mark.asyncio
+async def test_deleting_representative_keeps_remaining_copy(tmpdir: Path) -> None:
+    """Deleting the file named in the row keeps the photo under the other copy."""
+    (tmpdir / "a.jpg").write_bytes(_unique_jpeg(0))
+    (tmpdir / "b.jpg").write_bytes(_unique_jpeg(0))
+    backend = LocalBackend(root=tmpdir)
+    await index_partition(backend, "")
+    assert [r["filename"] for r in await _rows(backend)] == ["a.jpg"]
+
+    (tmpdir / "a.jpg").unlink()
+    await index_partition(backend, "")
+
+    rows = await _rows(backend)
+    assert [r["filename"] for r in rows] == ["b.jpg"]
+
+
+@pytest.mark.asyncio
+async def test_deleting_representative_keeps_indexed_copy(tmpdir: Path) -> None:
+    """Same, when the remaining copy already had its own (duplicate-key) row."""
+    (tmpdir / "a.jpg").write_bytes(_unique_jpeg(0))
+    (tmpdir / "b.jpg").write_bytes(_unique_jpeg(0))
+    backend = LocalBackend(root=tmpdir)
+    await index_partition(backend, "")
+    await _seed_duplicate_row(backend, "a.jpg", "b.jpg")
+
+    (tmpdir / "a.jpg").unlink()
+    await index_partition(backend, "")
+
+    rows = await _rows(backend)
+    assert [r["filename"] for r in rows] == ["b.jpg"]
+
+
+@pytest.mark.asyncio
+async def test_swapped_content_keeps_both_rows(tmpdir: Path) -> None:
+    """Two files swap bytes: both stay indexed, with each other's former hash."""
+    (tmpdir / "x.jpg").write_bytes(_unique_jpeg(0))
+    (tmpdir / "y.jpg").write_bytes(_unique_jpeg(1))
+    backend = LocalBackend(root=tmpdir)
+    await index_partition(backend, "")
+    before = {r["filename"]: r["content_hash"] for r in await _rows(backend)}
+
+    (tmpdir / "x.jpg").write_bytes(_unique_jpeg(1))
+    (tmpdir / "y.jpg").write_bytes(_unique_jpeg(0))
+    await index_partition(backend, "", force_full_index=True, force_extract_exif=True)
+
+    after = {r["filename"]: r["content_hash"] for r in await _rows(backend)}
+    assert after == {"x.jpg": before["y.jpg"], "y.jpg": before["x.jpg"]}
+
+
+async def _failing_extract(xmp_store, photo_path, force_extract_exif):
+    raise OSError("transient read error")
+
+
+@pytest.mark.asyncio
+async def test_repair_keeps_rows_when_holder_fails_extraction(tmpdir: Path) -> None:
+    """A duplicate-key hash is not deleted when the only file holding it fails
+    extraction: nothing could write it back, and the photo would vanish."""
+    (tmpdir / "a.jpg").write_bytes(_unique_jpeg(0))
+    backend = LocalBackend(root=tmpdir)
+    await index_partition(backend, "")
+    await _seed_duplicate_row(backend, "a.jpg", "a.jpg")
+
+    with patch("whitebeard.indexer._extract_one", side_effect=_failing_extract):
+        result = await index_partition(backend, "")
+
+    assert result.errors == 1
+    assert {r["filename"] for r in await _rows(backend)} == {"a.jpg"}
+
+    # A later run with a healthy read completes the repair.
+    await index_partition(backend, "")
+    assert len(await _rows(backend)) == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_file_is_processed_once(tmpdir: Path) -> None:
+    """In full mode, a file that fails extraction and holds a stale hash is not
+    retried by the write-back loop: counts stay consistent."""
+    (tmpdir / "a.jpg").write_bytes(_unique_jpeg(0))
+    backend = LocalBackend(root=tmpdir)
+    await index_partition(backend, "")
+    await _seed_duplicate_row(backend, "a.jpg", "a.jpg")
+
+    with patch("whitebeard.indexer._extract_one", side_effect=_failing_extract):
+        result = await index_partition(backend, "", force_full_index=True)
+
+    assert result.photos_processed == 1
+    assert result.photos_skipped == 0
+    assert result.errors == 1
+    assert len(result.error_details) == 1
+
+
+@pytest.mark.asyncio
+async def test_reprocessed_file_with_new_hash_gets_thumbnail(tmpdir: Path) -> None:
+    """A re-processed, already-indexed filename whose hash is new has no
+    thumbnail to carry over, so it is passed to the thumbnail builder."""
+    (tmpdir / "photo.jpg").write_bytes(_unique_jpeg(0))
+    backend = LocalBackend(root=tmpdir)
+    await index_partition(backend, "")
+    # Leftover of cause A: a second row for the filename, under another hash.
+    (row,) = await _rows(backend)
+    idx = await LanceIndex.open(backend, PHOTO_TABLE_NAME)
+    await idx._table.add(
+        pa.Table.from_pylist([{**row, "content_hash": "old_hash"}], schema=PHOTO_SCHEMA)
+    )
+    (tmpdir / "photo.jpg").write_bytes(_unique_jpeg(1))
+
+    thumbnail_call_args: list = []
+
+    async def capturing_thumbnails(b, partition, entries, tier):
+        thumbnail_call_args.append([e.filename for e in entries])
+        return []
+
+    with patch(
+        "whitebeard.indexer.generate_partition_thumbnails",
+        side_effect=capturing_thumbnails,
+    ):
+        await index_partition(backend, "", generate_thumbnails=True, force_extract_exif=True)
+
+    assert thumbnail_call_args == [["photo.jpg"]]
+    rows = await _rows(backend)
+    assert len(rows) == 1
+    assert rows[0]["content_hash"] not in {row["content_hash"], "old_hash"}
+
+
+# ---------------------------------------------------------------------------
 # Deleted partition cleanup
 # ---------------------------------------------------------------------------
 
@@ -1210,6 +1477,42 @@ async def test_index_partition_scope_indexes_only_listed_partitions(tmpdir: Path
     assert "2024/2024-07" in partitions
     assert "2024/2024-08" in partitions
     assert "2024/2024-09" not in partitions
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "bad",
+    ["2024/2024-07?", "2024-07", "missing", "2024/2024-07/a.jpg", "/2024/2024-07", "../2024"],
+)
+async def test_index_partition_scope_rejects_missing_partition(tmpdir: Path, bad: str) -> None:
+    """A scope entry that is not an existing folder fails the whole run, naming
+    the entry, before any partition is indexed."""
+    (tmpdir / "2024" / "2024-07").mkdir(parents=True)
+    (tmpdir / "2024" / "2024-07" / "a.jpg").write_bytes(_MINIMAL_JPEG)
+    backend = LocalBackend(root=tmpdir)
+    await ManifestStore(backend).write_full_summary(RootSummary(schema_version=SCHEMA_VERSION))
+
+    with pytest.raises(ValueError, match="not found") as exc_info:
+        await index_partition_scope(backend, ["2024/2024-07", bad])
+
+    listed = str(exc_info.value).split(". Paths are")[0]
+    assert listed.endswith(repr(bad))  # only the bad entry is listed
+    lance_index = await LanceIndex.open(backend, PHOTO_TABLE_NAME, create_if_missing=True)
+    assert await lance_index.list_partitions() == set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("good", ["", "2024", "2024/2024-07", "2024/2024-07/"])
+async def test_index_partition_scope_accepts_existing_partition(tmpdir: Path, good: str) -> None:
+    """The library root, a parent folder and a trailing slash are all accepted."""
+    (tmpdir / "2024" / "2024-07").mkdir(parents=True)
+    (tmpdir / "2024" / "2024-07" / "a.jpg").write_bytes(_MINIMAL_JPEG)
+    backend = LocalBackend(root=tmpdir)
+    await ManifestStore(backend).write_full_summary(RootSummary(schema_version=SCHEMA_VERSION))
+
+    result = await index_partition_scope(backend, [good])
+
+    assert len(result.partitions) == 1
 
 
 @pytest.mark.asyncio

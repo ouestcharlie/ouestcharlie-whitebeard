@@ -143,8 +143,10 @@ class WhitebeardAgent(AgentBase):
             only the given entries are touched.
 
             Args:
-                partition_scope: Folder paths to index, e.g.
-                    ``["2024/2024-07", "2024/2024-08"]``.
+                partition_scope: Folder paths to index, relative to the
+                    library root, e.g. ``["2024/2024-07", "2024/2024-08"]``.
+                    Every entry must be an existing folder, otherwise the
+                    run fails before indexing anything.
                 force_extract_exif: Re-extract EXIF and overwrite existing
                     XMP sidecars.  Defaults to False.
                 generate_thumbnails: Generate ``thumbnails.avif`` AVIF grids
