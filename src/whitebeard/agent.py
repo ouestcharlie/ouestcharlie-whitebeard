@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 from mcp.server.mcpserver import Context
 from ouestcharlie_toolkit.schema import METADATA_DIR
@@ -33,7 +34,7 @@ class WhitebeardAgent(AgentBase):
             force_extract_exif: bool = False,
             generate_thumbnails: bool = True,
             force_full_index: bool = False,
-        ) -> dict:
+        ) -> dict[str, Any]:
             """Recursively index all photos in the library and build manifests.
 
             By default runs in **incremental mode**: each partition is indexed
@@ -124,7 +125,7 @@ class WhitebeardAgent(AgentBase):
             force_extract_exif: bool = False,
             generate_thumbnails: bool = True,
             force_full_index: bool = False,
-        ) -> dict:
+        ) -> dict[str, Any]:
             """Index an explicit list of partition folders.
 
             By default runs in **incremental mode**: each partition is indexed
@@ -208,7 +209,7 @@ class WhitebeardAgent(AgentBase):
             }
 
         @mcp.tool(name="purge_metadata")
-        async def purge_metadata_tool(ctx: Context) -> dict:
+        async def purge_metadata_tool(ctx: Context) -> dict[str, Any]:
             """Delete the library's ``.ouestcharlie/`` metadata directory.
 
             Removes all derived artefacts — manifests, ``summary.json``, the
