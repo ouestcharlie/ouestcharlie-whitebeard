@@ -99,6 +99,7 @@ class WhitebeardAgent(AgentBase):
                     force_full_index=force_full_index,
                     on_progress=_library_progress,
                     lance_index_path=self.lance_index_path_override,
+                    excluded_tag_prefixes=self.excluded_tag_prefixes,
                 )
             except Exception as exc:
                 # TaskGroup wraps partition failures in an ExceptionGroup — unwrap the first.
@@ -191,6 +192,7 @@ class WhitebeardAgent(AgentBase):
                     force_full_index=force_full_index,
                     on_progress=_scope_progress,
                     lance_index_path=self.lance_index_path_override,
+                    excluded_tag_prefixes=self.excluded_tag_prefixes,
                 )
             except Exception as exc:
                 cause = exc.exceptions[0] if isinstance(exc, BaseExceptionGroup) else exc

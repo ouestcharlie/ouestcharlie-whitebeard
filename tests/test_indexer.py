@@ -1640,3 +1640,69 @@ async def test_index_partition_scope_progress_callback_called_for_each_partition
     assert len(calls) == 2
     assert {c[2] for c in calls} == {"A", "B"}
     assert all(c[1] == 2 for c in calls)
+
+
+# ---------------------------------------------------------------------------
+# Hierarchical tags — darktable sidecars and excluded tag prefixes
+# ---------------------------------------------------------------------------
+
+_DARKTABLE_SIDECAR = """\
+<x:xmpmeta xmlns:x='adobe:ns:meta/'>
+ <rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'>
+  <rdf:Description rdf:about=''
+    xmlns:dc='http://purl.org/dc/elements/1.1/'
+    xmlns:lr='http://ns.adobe.com/lightroom/1.0/'
+    xmlns:darktable='http://darktable.sf.net/'>
+   <dc:subject><rdf:Bag>
+    <rdf:li>darktable</rdf:li><rdf:li>format</rdf:li><rdf:li>jpg</rdf:li>
+    <rdf:li>Places</rdf:li><rdf:li>Europe</rdf:li><rdf:li>Paris</rdf:li>
+   </rdf:Bag></dc:subject>
+   <lr:hierarchicalSubject><rdf:Bag>
+    <rdf:li>darktable|format|jpg</rdf:li>
+    <rdf:li>Places|Europe|Paris</rdf:li>
+   </rdf:Bag></lr:hierarchicalSubject>
+   <darktable:history><rdf:Seq/></darktable:history>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>"""
+
+
+async def _indexed_tags(backend: LocalBackend) -> tuple[list[str], list[str]]:
+    lance_index = await LanceIndex.open(backend, PHOTO_TABLE_NAME)
+    rows = [r async for r in lance_index.get_partition_rows("", columns=["tags", "tag_terms"])]
+    assert len(rows) == 1
+    return rows[0]["tags"], rows[0]["tag_terms"]
+
+
+@pytest.mark.asyncio
+async def test_index_darktable_sidecar_excludes_darktable_tags_by_default(
+    backend_with_sample: LocalBackend, tmpdir: Path
+) -> None:
+    (tmpdir / "001.jpg.xmp").write_text(_DARKTABLE_SIDECAR, encoding="utf-8")
+    await index_partition(backend_with_sample, "")
+    tags, terms = await _indexed_tags(backend_with_sample)
+    assert tags == ["Places|Europe|Paris"]
+    # tag_terms are folded for case-insensitive search; tags keep their spelling
+    assert terms == ["places", "places|europe", "places|europe|paris", "europe", "paris"]
+    # Indexing reads the sidecar without rewriting it.
+    assert (tmpdir / "001.jpg.xmp").read_text(encoding="utf-8") == _DARKTABLE_SIDECAR
+
+
+@pytest.mark.asyncio
+async def test_index_custom_excluded_tag_prefixes(
+    backend_with_sample: LocalBackend, tmpdir: Path
+) -> None:
+    (tmpdir / "001.jpg.xmp").write_text(_DARKTABLE_SIDECAR, encoding="utf-8")
+    await index_partition(backend_with_sample, "", excluded_tag_prefixes=["Places"])
+    tags, _ = await _indexed_tags(backend_with_sample)
+    assert tags == ["darktable|format|jpg"]
+
+
+@pytest.mark.asyncio
+async def test_index_library_passes_excluded_tag_prefixes(
+    backend_with_sample: LocalBackend, tmpdir: Path
+) -> None:
+    (tmpdir / "001.jpg.xmp").write_text(_DARKTABLE_SIDECAR, encoding="utf-8")
+    await index_library(backend_with_sample, excluded_tag_prefixes=[])
+    tags, _ = await _indexed_tags(backend_with_sample)
+    assert tags == ["darktable|format|jpg", "Places|Europe|Paris"]

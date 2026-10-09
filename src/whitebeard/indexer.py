@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import Awaitable, Callable, Generator
+from collections.abc import Awaitable, Callable, Generator, Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from itertools import chain, islice
@@ -22,6 +22,7 @@ from ouestcharlie_toolkit.schema import (
     RootSummary,
     ThumbnailChunk,
 )
+from ouestcharlie_toolkit.tags import DEFAULT_EXCLUDED_TAG_PREFIXES
 from ouestcharlie_toolkit.thumbnail_builder import (
     delete_partition_thumbnails,
     generate_partition_thumbnails,
@@ -126,6 +127,7 @@ async def index_partition(
     force_full_index: bool = False,
     lance_index: LanceIndex | None = None,
     lance_index_path: Path | None = None,
+    excluded_tag_prefixes: Iterable[str] = DEFAULT_EXCLUDED_TAG_PREFIXES,
 ) -> IndexResult:
     """Index all photos in a partition (index mode — files stay in place).
 
@@ -171,6 +173,9 @@ async def index_partition(
             any concurrent tasks run, preventing concurrent ``create_table``
             calls that cause Lance MVCC conflicts.  Pass ``None`` (default)
             when calling ``index_partition`` directly; it will open its own.
+        excluded_tag_prefixes: Tag paths kept out of the index (library
+            setting, see ``ouestcharlie_toolkit.tags``). Defaults to
+            ``DEFAULT_EXCLUDED_TAG_PREFIXES``.
 
     Returns:
         IndexResult with counts of processed, skipped, deleted, created, and
@@ -178,7 +183,7 @@ async def index_partition(
     """
     _t0 = time.monotonic()
     result = IndexResult(partition=partition)
-    xmp_store = XmpStore(backend)
+    xmp_store = XmpStore(backend, excluded_tag_prefixes)
     if lance_index is None:
         lance_index = await LanceIndex.open(
             backend,
@@ -425,6 +430,7 @@ async def index_library(
     force_full_index: bool = False,
     on_progress: Callable[[int, int, str, int, int], Awaitable[None]] | None = None,
     lance_index_path: Path | None = None,
+    excluded_tag_prefixes: Iterable[str] = DEFAULT_EXCLUDED_TAG_PREFIXES,
 ) -> LibraryIndexResult:
     """Index all photos in a library.
 
@@ -523,6 +529,7 @@ async def index_library(
                 generate_thumbnails=generate_thumbnails,
                 force_full_index=force_full_index,
                 lance_index=lance_index,
+                excluded_tag_prefixes=excluded_tag_prefixes,
             )
         completed += 1
         if on_progress is not None:
@@ -573,6 +580,7 @@ async def index_partition_scope(
     force_full_index: bool = False,
     on_progress: Callable[[int, int, str, int, int], Awaitable[None]] | None = None,
     lance_index_path: Path | None = None,
+    excluded_tag_prefixes: Iterable[str] = DEFAULT_EXCLUDED_TAG_PREFIXES,
 ) -> LibraryIndexResult:
     """Index an explicit list of partitions (leaf folders, direct children only).
 
@@ -664,6 +672,7 @@ async def index_partition_scope(
                 generate_thumbnails=generate_thumbnails,
                 force_full_index=force_full_index,
                 lance_index=lance_index,
+                excluded_tag_prefixes=excluded_tag_prefixes,
             )
         completed += 1
         if on_progress is not None:
