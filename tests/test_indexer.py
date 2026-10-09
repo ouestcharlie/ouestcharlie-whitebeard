@@ -1682,7 +1682,8 @@ async def test_index_darktable_sidecar_excludes_darktable_tags_by_default(
     await index_partition(backend_with_sample, "")
     tags, terms = await _indexed_tags(backend_with_sample)
     assert tags == ["Places|Europe|Paris"]
-    assert terms == ["Places", "Places|Europe", "Places|Europe|Paris", "Europe", "Paris"]
+    # tag_terms are folded for case-insensitive search; tags keep their spelling
+    assert terms == ["places", "places|europe", "places|europe|paris", "europe", "paris"]
     # Indexing reads the sidecar without rewriting it.
     assert (tmpdir / "001.jpg.xmp").read_text(encoding="utf-8") == _DARKTABLE_SIDECAR
 
