@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pyarrow as pa
@@ -15,7 +17,7 @@ from ouestcharlie_toolkit.backends.local import LocalBackend
 from ouestcharlie_toolkit.lance_index import PHOTO_SCHEMA, PHOTO_TABLE_NAME, LanceIndex
 from ouestcharlie_toolkit.manifest import ManifestStore
 from ouestcharlie_toolkit.schema import LOWEST_SCHEMA_VERSION, SCHEMA_VERSION, RootSummary
-from ouestcharlie_toolkit.xmp import parse_xmp
+from ouestcharlie_toolkit.xmp import XmpStore, parse_xmp, serialize_xmp
 
 from whitebeard.indexer import (
     _MAX_CONCURRENT_PARTITIONS,
@@ -1121,10 +1123,13 @@ def _assert_unique_keys(rows: list[dict]) -> None:
 
 async def _seed_duplicate_row(backend: LocalBackend, source: str, filename: str) -> None:
     """Append a copy of ``source``'s row named ``filename``, bypassing merge_insert,
-    to recreate a duplicate merge key as left by pre-OEC-11b indexes."""
+    to recreate a duplicate merge key as left by pre-OEC-11b indexes. The copy
+    carries ``filename``'s own sidecar token, as a row indexed from it would."""
     idx = await LanceIndex.open(backend, PHOTO_TABLE_NAME)
     row = next(r for r in await _rows(backend) if r["filename"] == source)
-    await idx._table.add(pa.Table.from_pylist([{**row, "filename": filename}], schema=PHOTO_SCHEMA))
+    token = str((backend.root / f"{filename}.xmp").stat().st_mtime_ns)
+    seeded = {**row, "filename": filename, "xmp_version_token": token}
+    await idx._table.add(pa.Table.from_pylist([seeded], schema=PHOTO_SCHEMA))
 
 
 @pytest.mark.asyncio
@@ -1706,3 +1711,184 @@ async def test_index_library_passes_excluded_tag_prefixes(
     await index_library(backend_with_sample, excluded_tag_prefixes=[])
     tags, _ = await _indexed_tags(backend_with_sample)
     assert tags == ["darktable|format|jpg", "Places|Europe|Paris"]
+
+
+# ---------------------------------------------------------------------------
+# Incremental mode — sidecars changed by other tools
+# ---------------------------------------------------------------------------
+
+_SAMPLES = Path(__file__).parent / "sample-images"
+
+
+def _rewrite_sidecar(path: Path, xml: str) -> None:
+    """Write ``xml`` to a sidecar with a later mtime, as another tool would."""
+    old_ns = path.stat().st_mtime_ns if path.exists() else 0
+    path.write_text(xml, encoding="utf-8")
+    new_ns = max(path.stat().st_mtime_ns, old_ns + 1_000_000_000)
+    os.utime(path, ns=(new_ns, new_ns))
+
+
+def _edit_sidecar(path: Path, **fields: object) -> None:
+    sidecar = parse_xmp(path.read_text(encoding="utf-8"))
+    for name, value in fields.items():
+        setattr(sidecar, name, value)
+    _rewrite_sidecar(path, serialize_xmp(sidecar))
+
+
+def _row(rows: list[dict], filename: str) -> dict:
+    return next(r for r in rows if r["filename"] == filename)
+
+
+@pytest.mark.asyncio
+async def test_incremental_picks_up_sidecar_edit(tmpdir: Path) -> None:
+    for i in range(3):
+        (tmpdir / f"p{i}.jpg").write_bytes(_unique_jpeg(i))
+    backend = LocalBackend(root=tmpdir)
+    await index_partition(backend, "")
+
+    _edit_sidecar(tmpdir / "p1.jpg.xmp", rating=4, description="Edited elsewhere")
+    result = await index_partition(backend, "")
+
+    assert result.sidecars_changed == 1
+    assert result.photos_processed == 1
+    assert result.photos_skipped == 2
+    assert result.sidecars_created == 0
+    rows = await _rows(backend)
+    _assert_unique_keys(rows)
+    row = _row(rows, "p1.jpg")
+    assert row["rating"] == 4
+    assert row["description"] == "Edited elsewhere"
+    assert row["xmp_version_token"] == str((tmpdir / "p1.jpg.xmp").stat().st_mtime_ns)
+
+
+@pytest.mark.asyncio
+async def test_incremental_sidecar_edit_keeps_thumbnail(tmpdir: Path) -> None:
+    (tmpdir / "a.jpg").write_bytes(_unique_jpeg(0))
+    backend = LocalBackend(root=tmpdir)
+
+    async def fake_thumbnails(b, partition, entries, tier):
+        order = [e.content_hash for e in entries]
+        return [SimpleNamespace(avif_hash="avif0", grid=SimpleNamespace(photo_order=order))]
+
+    with patch("whitebeard.indexer.generate_partition_thumbnails", side_effect=fake_thumbnails):
+        await index_partition(backend, "", generate_thumbnails=True)
+    (before,) = await _rows(backend)
+    assert before["thumbnail_avif_hash"] == "avif0"
+
+    _edit_sidecar(tmpdir / "a.jpg.xmp", rating=5)
+    calls = 0
+
+    async def counting_thumbnails(b, partition, entries, tier):
+        nonlocal calls
+        calls += 1
+        return []
+
+    with patch("whitebeard.indexer.generate_partition_thumbnails", side_effect=counting_thumbnails):
+        result = await index_partition(backend, "", generate_thumbnails=True)
+
+    assert result.sidecars_changed == 1
+    assert calls == 0
+    assert result.thumbnails_rebuilt is False
+    (after,) = await _rows(backend)
+    assert after["rating"] == 5
+    assert after["content_hash"] == before["content_hash"]
+    assert after["thumbnail_avif_hash"] == before["thumbnail_avif_hash"]
+    assert after["thumbnail_tile_index"] == before["thumbnail_tile_index"]
+
+
+@pytest.mark.asyncio
+async def test_incremental_skips_unchanged_sidecar(tmpdir: Path) -> None:
+    for i in range(2):
+        (tmpdir / f"p{i}.jpg").write_bytes(_unique_jpeg(i))
+    backend = LocalBackend(root=tmpdir)
+    await index_partition(backend, "")
+    await index_partition(backend, "")
+
+    reads = 0
+    original_read = XmpStore.read
+
+    async def counting_read(self, photo_path):
+        nonlocal reads
+        reads += 1
+        return await original_read(self, photo_path)
+
+    with patch.object(XmpStore, "read", counting_read):
+        result = await index_partition(backend, "")
+
+    assert result.photos_processed == 0
+    assert result.photos_skipped == 2
+    assert result.sidecars_changed == 0
+    assert reads == 0
+
+
+@pytest.mark.asyncio
+async def test_incremental_recreates_deleted_sidecar(tmpdir: Path) -> None:
+    (tmpdir / "a.jpg").write_bytes(_unique_jpeg(0))
+    backend = LocalBackend(root=tmpdir)
+    await index_partition(backend, "")
+    (tmpdir / "a.jpg.xmp").unlink()
+
+    result = await index_partition(backend, "")
+
+    assert result.sidecars_changed == 1
+    assert result.sidecars_created == 1
+    assert (tmpdir / "a.jpg.xmp").exists()
+    (row,) = await _rows(backend)
+    assert row["xmp_version_token"] == str((tmpdir / "a.jpg.xmp").stat().st_mtime_ns)
+    # The re-created sidecar is now current: the next run skips the photo.
+    again = await index_partition(backend, "")
+    assert again.photos_processed == 0
+
+
+@pytest.mark.asyncio
+async def test_incremental_follows_new_full_extension_sidecar(tmpdir: Path) -> None:
+    (tmpdir / "a.jpg").write_bytes(_unique_jpeg(0))
+    backend = LocalBackend(root=tmpdir)
+    await index_partition(backend, "")
+    # Turn the sidecar into the extension-stripped form (Lightroom), rated 2.
+    stripped = tmpdir / "a.xmp"
+    (tmpdir / "a.jpg.xmp").rename(stripped)
+    _edit_sidecar(stripped, rating=2)
+    await index_partition(backend, "")
+    (row,) = await _rows(backend)
+    assert row["rating"] == 2
+
+    # darktable then writes its own full-extension sidecar, rated 3.
+    sidecar = parse_xmp(stripped.read_text(encoding="utf-8"))
+    sidecar.rating = 3
+    _rewrite_sidecar(tmpdir / "a.jpg.xmp", serialize_xmp(sidecar))
+    result = await index_partition(backend, "")
+
+    assert result.sidecars_changed == 1
+    (row,) = await _rows(backend)
+    assert row["rating"] == 3
+    assert row["xmp_version_token"] == str((tmpdir / "a.jpg.xmp").stat().st_mtime_ns)
+
+
+@pytest.mark.asyncio
+async def test_incremental_darktable_sidecar(
+    backend_with_sample: LocalBackend, tmpdir: Path
+) -> None:
+    await index_partition(backend_with_sample, "")
+    (before,) = await _rows(backend_with_sample)
+
+    # darktable keeps ouestcharlie:contentHash when it rewrites the sidecar.
+    xml = (
+        (_SAMPLES / "001.darktable.ref.xmp")
+        .read_text(encoding="utf-8")
+        .replace("KfAbc123A2nBcR8xYvLm1P", before["content_hash"])
+        .replace(
+            "<rdf:li>darktable|format|jpg</rdf:li>",
+            "<rdf:li>darktable|format|jpg</rdf:li>\n     <rdf:li>Places|Europe|Paris</rdf:li>",
+        )
+    )
+    _rewrite_sidecar(tmpdir / "001.jpg.xmp", xml)
+    result = await index_partition(backend_with_sample, "")
+
+    assert result.sidecars_changed == 1
+    (after,) = await _rows(backend_with_sample)
+    assert after["content_hash"] == before["content_hash"]
+    assert after["rating"] == 1
+    assert after["tags"] == ["Places|Europe|Paris"]
+    assert after["date_taken"] == before["date_taken"]
+    assert after["date_taken_utc"] == before["date_taken_utc"]
