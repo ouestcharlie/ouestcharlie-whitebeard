@@ -217,14 +217,18 @@ async def index_partition(
     sidecar_tokens_folded = {name.casefold(): t for name, t in sidecar_tokens.items()}
 
     def current_token(photo_path: str) -> str | None:
-        """Token of the sidecar the reader would open, or None without sidecar."""
-        names = [PurePath(c).name for c in sidecar_candidates(photo_path)]
-        for name in names:
-            if name in sidecar_tokens:
-                return sidecar_tokens[name]
-        for name in names:
-            if name.casefold() in sidecar_tokens_folded:
-                return sidecar_tokens_folded[name.casefold()]
+        """Token of the sidecar the reader would open, or None without sidecar.
+
+        Candidates are tried in the reader's order, each one exactly then
+        case-insensitively, as the reader's existence check behaves on a
+        case-insensitive filesystem: a case variant of the full-extension
+        form wins over an exact extension-stripped one.
+        """
+        for candidate in sidecar_candidates(photo_path):
+            name = PurePath(candidate).name
+            token = sidecar_tokens.get(name) or sidecar_tokens_folded.get(name.casefold())
+            if token is not None:
+                return token
         return None
 
     # Hold the partition lock for the entire read → process → write cycle so

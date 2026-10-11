@@ -1892,3 +1892,37 @@ async def test_incremental_darktable_sidecar(
     assert after["tags"] == ["Places|Europe|Paris"]
     assert after["date_taken"] == before["date_taken"]
     assert after["date_taken_utc"] == before["date_taken_utc"]
+
+
+def _case_insensitive_fs(path: Path) -> bool:
+    probe = path / "CaseProbe"
+    probe.touch()
+    try:
+        return (path / "caseprobe").exists()
+    finally:
+        probe.unlink()
+
+
+@pytest.mark.asyncio
+async def test_incremental_case_variant_sidecar_wins_like_reader(tmpdir: Path) -> None:
+    """On a case-insensitive filesystem the reader opens ``a.JPG.xmp`` for
+    ``a.jpg`` even when ``a.xmp`` exists: the token must come from the same file,
+    or the photo is re-processed at every run."""
+    if not _case_insensitive_fs(tmpdir):
+        pytest.skip("needs a case-insensitive filesystem")
+    (tmpdir / "a.jpg").write_bytes(_unique_jpeg(0))
+    backend = LocalBackend(root=tmpdir)
+    await index_partition(backend, "")
+    (tmpdir / "a.jpg.xmp").rename(tmpdir / "a.JPG.xmp")
+    stripped = parse_xmp((tmpdir / "a.JPG.xmp").read_text(encoding="utf-8"))
+    stripped.rating = 1
+    _rewrite_sidecar(tmpdir / "a.xmp", serialize_xmp(stripped))
+    _edit_sidecar(tmpdir / "a.JPG.xmp", rating=4)
+
+    first = await index_partition(backend, "")
+    second = await index_partition(backend, "")
+
+    assert first.sidecars_changed == 1
+    (row,) = await _rows(backend)
+    assert row["rating"] == 4
+    assert second.photos_processed == 0
