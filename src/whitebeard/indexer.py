@@ -28,7 +28,7 @@ from ouestcharlie_toolkit.thumbnail_builder import (
     generate_partition_thumbnails,
 )
 from ouestcharlie_toolkit.video import VIDEO_SUFFIXES
-from ouestcharlie_toolkit.xmp import XmpStore
+from ouestcharlie_toolkit.xmp import XmpStore, sidecar_candidates
 
 _log = logging.getLogger(__name__)
 
@@ -73,6 +73,7 @@ class IndexResult:
     photos_skipped: int = 0  # photos already in manifest, carried over without re-processing
     photos_deleted: int = 0  # photos in previous manifest but no longer on disk
     sidecars_created: int = 0
+    sidecars_changed: int = 0  # indexed photos re-processed because their sidecar changed
     sidecars_skipped: int = 0
     errors: int = 0
     error_details: list[str] = field(default_factory=list)
@@ -105,6 +106,10 @@ class LibraryIndexResult:
         return sum(r.sidecars_created for r in self.partitions)
 
     @property
+    def total_sidecars_changed(self) -> int:
+        return sum(r.sidecars_changed for r in self.partitions)
+
+    @property
     def total_errors(self) -> int:
         return sum(r.errors for r in self.partitions)
 
@@ -132,9 +137,13 @@ async def index_partition(
     """Index all photos in a partition (index mode — files stay in place).
 
     By default (``force_full_index=False``) runs in incremental mode: photos
-    already present in the leaf manifest are carried over without re-processing.
-    Only photos absent from the manifest (new arrivals) go through
-    ``_extract_one``.
+    already indexed whose sidecar is unchanged are carried over without
+    re-processing (nor reading their sidecar). New photos, and photos whose
+    sidecar was rewritten (e.g. by darktable), created, deleted or replaced by
+    the other naming form since the last index, go through ``_extract_one``.
+    A change is detected by comparing the sidecar's version token from the
+    directory listing with the one stored in the index (equality, not order);
+    a sidecar whose mtime is set back to the indexed value is not detected.
 
     With ``force_full_index=True`` all photos are re-processed regardless of
     the existing manifest, matching the previous unconditional behaviour.
@@ -192,9 +201,35 @@ async def index_partition(
             index_path=lance_index_path,
         )
 
-    # List only direct-child media files (photos + videos) — read-only, no lock needed.
-    photo_files = await backend.list_files(partition, MEDIA_EXTENSIONS)
+    # List direct-child media files (photos + videos) and their sidecars in one
+    # call — read-only, no lock needed.
+    listed = await backend.list_files(partition, MEDIA_EXTENSIONS | {".xmp"})
+    photo_files = [f for f in listed if PurePath(f.path).suffix.lower() != ".xmp"]
     disk_filenames: set[str] = {PurePath(f.path).name for f in photo_files}
+    # Sidecar filename → version token, in the string form stored in the index.
+    sidecar_tokens: dict[str, str] = {
+        PurePath(f.path).name: str(f.version.value)
+        for f in listed
+        if PurePath(f.path).suffix.lower() == ".xmp"
+    }
+    # Case-insensitive fallback, matching what the reader opens on a
+    # case-insensitive filesystem (e.g. ``IMG_001.JPG.XMP``).
+    sidecar_tokens_folded = {name.casefold(): t for name, t in sidecar_tokens.items()}
+
+    def current_token(photo_path: str) -> str | None:
+        """Token of the sidecar the reader would open, or None without sidecar.
+
+        Candidates are tried in the reader's order, each one exactly then
+        case-insensitively, as the reader's existence check behaves on a
+        case-insensitive filesystem: a case variant of the full-extension
+        form wins over an exact extension-stripped one.
+        """
+        for candidate in sidecar_candidates(photo_path):
+            name = PurePath(candidate).name
+            token = sidecar_tokens.get(name) or sidecar_tokens_folded.get(name.casefold())
+            if token is not None:
+                return token
+        return None
 
     # Hold the partition lock for the entire read → process → write cycle so
     # that no other agent can interleave writes on the same partition.
@@ -208,12 +243,20 @@ async def index_partition(
         filenames_by_hash: dict[str, set[str]] = {}
         rows_per_hash: dict[str, int] = {}
         existing_thumbs: dict[str, tuple[str, int]] = {}
+        indexed_tokens: dict[str, str] = {}
         async for row in lance_index.get_partition_rows(
             partition,
-            columns=["filename", "content_hash", "thumbnail_avif_hash", "thumbnail_tile_index"],
+            columns=[
+                "filename",
+                "content_hash",
+                "xmp_version_token",
+                "thumbnail_avif_hash",
+                "thumbnail_tile_index",
+            ],
         ):
             fn, h = row["filename"], row["content_hash"]
             hashes_by_filename.setdefault(fn, set()).add(h)
+            indexed_tokens[fn] = str(row.get("xmp_version_token") or "")
             filenames_by_hash.setdefault(h, set()).add(fn)
             rows_per_hash[h] = rows_per_hash.get(h, 0) + 1
             avif, tile = row.get("thumbnail_avif_hash"), row.get("thumbnail_tile_index")
@@ -257,15 +300,32 @@ async def index_partition(
                 result.errors += 1
                 result.error_details.append(f"{filename}: {exc}")
 
+        sidecar_changed: list[str] = []
         for file_info in photo_files:
             filename = PurePath(file_info.path).name
             path_by_filename[filename] = file_info.path
+            # An indexed photo whose sidecar was rewritten, created, deleted or
+            # replaced by the other naming form: re-read it to pick up edits made
+            # by other tools. The content hash survives a sidecar-only edit, so
+            # the row is updated in place and its thumbnail kept.
+            token = current_token(file_info.path)
+            changed = filename in hashes_by_filename and token != indexed_tokens[filename]
+            if changed:
+                sidecar_changed.append(filename)
             # A filename with several rows had its hash change: re-process it
             # even in incremental mode to learn which hash is current.
-            if force_full_index or len(hashes_by_filename.get(filename, ())) != 1:
+            if force_full_index or changed or len(hashes_by_filename.get(filename, ())) != 1:
                 await _process(file_info.path)
             else:
                 result.photos_skipped += 1
+        result.sidecars_changed = len(sidecar_changed)
+        if sidecar_changed:
+            _log.info(
+                "Index — %d sidecar(s) changed since last index — partition=%r: %s",
+                len(sidecar_changed),
+                partition,
+                ", ".join(sorted(sidecar_changed)),
+            )
 
         # Hashes whose rows must be deleted before the upsert:
         #   - every hash of a file gone from disk;

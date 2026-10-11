@@ -22,16 +22,16 @@ src/whitebeard/
 Indexes all photos directly in one folder (direct children only — subdirectories are separate partitions).
 
 **Steps:**
-1. Fetch existing LanceDB rows for the partition (`filename` + `content_hash` only) — used both to build the incremental skip map and to detect deletions. 
-2. List photo files on disk via `backend.list_files`.
+1. Fetch existing LanceDB rows for the partition (`filename`, `content_hash`, `xmp_version_token`) — used both to build the incremental skip map and to detect deletions.
+2. List photo files and `.xmp` sidecars on disk in one `backend.list_files` call. A photo's current sidecar token is the token of the first existing candidate in the reader's order (`sidecar_candidates`: `NAME.EXT.xmp`, then `NAME.xmp`), or none.
 3. Detect photos in the index but no longer on disk — log and schedule for deletion. Runs unconditionally, in both incremental and full-reindex mode.
-4. For each photo: if already indexed and `force_full_index=False`, skip (incremental). Otherwise read or create XMP sidecar. If `force_extract_exif=True`, re-extract and overwrite.
+4. For each photo: if `force_full_index=False`, indexed once **and** its current sidecar token equals the indexed `xmp_version_token`, skip (incremental). Otherwise read or create XMP sidecar. If `force_extract_exif=True`, re-extract and overwrite.
 5. If `generate_thumbnails=True` and there are new photos, generate AVIF chunks for newly-processed photos only (or all when `force_full_index=True`).
 6. Delete stale rows from the index; write all current entries in LanceIndex (preserving existing thumbnail data for unchanged photos).
 7. Compute `ManifestSummary` using a DuckDB aggregate query over the LanceDB index.
 8. Write the summary to the backend-wide `summary.json`.
 
-**Returns:** `IndexResult` (photos processed, skipped, deleted, sidecars created/skipped, errors, duration).
+**Returns:** `IndexResult` (photos processed, skipped, deleted, sidecars created/skipped/changed, errors, duration).
 
 ### `index_library(force_extract_exif=False, generate_thumbnails=True, force_full_index=False)`
 
@@ -48,11 +48,14 @@ Indexes the entire library under the backend root.
 
 ## Incremental Indexing
 
-Whitebeard defaults to incremental mode — photos already present in the LanceDB index are skipped without re-reading their XMP sidecars or re-extracting EXIF. Only new photos (filenames not in the index) are processed.
+Whitebeard defaults to incremental mode — photos already present in the LanceDB index whose sidecar is unchanged are skipped without re-reading their XMP sidecars or re-extracting EXIF. Only new photos (filenames not in the index) and photos whose sidecar changed are processed.
+
+- **Sidecar changes**: a sidecar rewritten by another tool (darktable, digiKam, Lightroom, a text editor), deleted (re-created from the media file), or superseded by the other naming form (darktable adding `NAME.EXT.xmp` next to an older `NAME.xmp`) has a token different from the indexed one, so the photo is re-read. The token comes from the directory listing, so detecting it costs no sidecar read. A sidecar-only edit keeps the content hash, so the row is updated in place and keeps its thumbnail. These photos are counted in `sidecars_changed` (and in `photos_processed`) and logged at INFO.
+- **Token comparison limit**: the token is the sidecar's mtime, compared for equality, not order. An edit synced from another device is detected even with clock skew or a coarser mtime precision on the cloud side; a sync client re-stamping files only causes one extra re-read. A sidecar whose mtime is set back to exactly the indexed value (`touch -d`, or `cp -p` / `rsync -a` restoring the indexed version) is not detected; use `force_full_index=True`. Sidecars are deliberately not hashed: that would read every sidecar at every run.
 
 - **Deleted photos**: photos in the LanceDB index but not on disk are deleted and logged at INFO level. This applies in both incremental and full-reindex (`force_full_index=True`) mode — deletion detection is not conditional on the incremental/full distinction, which only affects whether already-indexed photos get re-processed.
 - **Deleted partitions**: partitions in `summary.json` but no longer on disk are removed from the summary, their LanceDB rows deleted, and their `.ouestcharlie/<partition>/` directories deleted after the gather step in `index_library`.
-- **EXIF changes**: changes to EXIF fields in an already-indexed photo are NOT detected in incremental mode. Use `force_extract_exif=True` together with `force_full_index=True` to refresh all metadata.
+- **Media file changes**: changes to the media file itself (EXIF fields, a crop or re-export) while its sidecar is unchanged are NOT detected in incremental mode, and `force_full_index=True` alone keeps the content hash stored in the sidecar. Use `force_extract_exif=True` together with `force_full_index=True` to refresh all metadata.
 - **Thumbnail strategy**: new AVIF chunks are generated only for newly-processed photos. `LanceIndex.upsert_partition` preserves existing thumbnail data for photos not included in the new thumbnail generation pass. `force_full_index=True` re-generates all thumbnail chunks for the partition.
 
 ## Concurrency Model

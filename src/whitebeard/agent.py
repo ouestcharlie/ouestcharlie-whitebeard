@@ -38,8 +38,9 @@ class WhitebeardAgent(AgentBase):
             """Recursively index all photos in the library and build manifests.
 
             By default runs in **incremental mode**: each partition is indexed
-            incrementally — only new photos are processed; already-indexed
-            photos are skipped. Use ``force_full_index=True`` to re-process
+            incrementally — only new photos and photos whose XMP sidecar
+            changed (e.g. edited in darktable) are processed; other
+            already-indexed photos are skipped. Use ``force_full_index=True`` to re-process
             all photos across the entire library, regardless of manifest
             state. Photos deleted from disk since the last run are always
             detected and removed from the index, in both incremental and
@@ -66,10 +67,13 @@ class WhitebeardAgent(AgentBase):
             Returns:
                 ``partitionsIndexed`` — number of leaf partitions processed.
                 ``partitionsDeleted`` — stale partitions removed from summary.
-                ``totalPhotos`` — photos indexed in this run (new or force-reindexed).
+                ``totalPhotos`` — photos indexed in this run (new, sidecar changed
+                    or force-reindexed).
                 ``totalPhotosSkipped`` — photos carried over from existing manifests.
                 ``totalPhotosDeleted`` — photos removed from disk across all partitions.
                 ``totalSidecarsCreated`` — XMP sidecars written.
+                ``totalSidecarsChanged`` — indexed photos re-read because their
+                    sidecar changed since the last index.
                 ``totalThumbnailsRebuilt`` — partitions where a new AVIF chunk was generated.
                 ``totalErrors`` — count of photos that failed processing.
                 ``errorDetails`` — list of per-photo error messages across all partitions.
@@ -113,6 +117,7 @@ class WhitebeardAgent(AgentBase):
                 "totalPhotosSkipped": result.total_photos_skipped,
                 "totalPhotosDeleted": result.total_photos_deleted,
                 "totalSidecarsCreated": result.total_sidecars_created,
+                "totalSidecarsChanged": result.total_sidecars_changed,
                 "totalThumbnailsRebuilt": result.total_thumbnails_rebuilt,
                 "totalErrors": result.total_errors,
                 "topErrorDetails": list(result.top_error_details),
@@ -130,8 +135,9 @@ class WhitebeardAgent(AgentBase):
             """Index an explicit list of partition folders.
 
             By default runs in **incremental mode**: each partition is indexed
-            incrementally — only new photos are processed; already-indexed
-            photos are skipped. Use ``force_full_index=True`` to re-process
+            incrementally — only new photos and photos whose XMP sidecar
+            changed (e.g. edited in darktable) are processed; other
+            already-indexed photos are skipped. Use ``force_full_index=True`` to re-process
             all photos in every listed partition, regardless of manifest
             state. Photos deleted from disk since the last run are always
             detected and removed from the index, in both incremental and
@@ -158,10 +164,13 @@ class WhitebeardAgent(AgentBase):
 
             Returns:
                 ``partitionsIndexed`` — number of partitions processed.
-                ``totalPhotos`` — photos indexed in this run (new or force-reindexed).
+                ``totalPhotos`` — photos indexed in this run (new, sidecar changed
+                    or force-reindexed).
                 ``totalPhotosSkipped`` — photos carried over from existing manifests.
                 ``totalPhotosDeleted`` — photos removed from disk across all partitions.
                 ``totalSidecarsCreated`` — XMP sidecars written.
+                ``totalSidecarsChanged`` — indexed photos re-read because their
+                    sidecar changed since the last index.
                 ``totalThumbnailsRebuilt`` — partitions where a new AVIF chunk was generated.
                 ``totalErrors`` — count of photos that failed processing.
                 ``errorDetails`` — list of per-photo error messages across all partitions.
@@ -204,6 +213,7 @@ class WhitebeardAgent(AgentBase):
                 "totalPhotosSkipped": result.total_photos_skipped,
                 "totalPhotosDeleted": result.total_photos_deleted,
                 "totalSidecarsCreated": result.total_sidecars_created,
+                "totalSidecarsChanged": result.total_sidecars_changed,
                 "totalThumbnailsRebuilt": result.total_thumbnails_rebuilt,
                 "totalErrors": result.total_errors,
                 "topErrorDetails": list(result.top_error_details),
