@@ -14,6 +14,7 @@ from pathlib import Path, PurePath
 from ouestcharlie_toolkit.backend import Backend
 from ouestcharlie_toolkit.lance_index import PHOTO_TABLE_NAME, LanceIndex
 from ouestcharlie_toolkit.manifest import ManifestStore
+from ouestcharlie_toolkit.photo import PHOTO_SUFFIXES
 from ouestcharlie_toolkit.schema import (
     LOWEST_SCHEMA_VERSION,
     METADATA_DIR,
@@ -39,29 +40,10 @@ _MAX_CONCURRENT_PARTITIONS = 4
 # Maximum number of errors to report
 _TOP_ERRORS = 10
 
-# Photo file extensions indexed by Whitebeard (case-insensitive).
-PHOTO_EXTENSIONS: frozenset[str] = frozenset(
-    {
-        ".jpg",
-        ".jpeg",
-        ".heic",
-        ".heif",
-        ".png",
-        ".dng",
-        ".cr2",
-        ".cr3",
-        ".nef",
-        ".arw",
-        ".raf",
-        ".orf",
-        ".rw2",
-    }
-)
-
 # All media extensions discovered during indexing (photos + videos). Files are
 # dispatched per-suffix inside XmpStore.read_or_create_from_picture: photos go
 # through EXIF extraction, videos (VIDEO_SUFFIXES) through container extraction.
-MEDIA_EXTENSIONS: frozenset[str] = PHOTO_EXTENSIONS | VIDEO_SUFFIXES
+MEDIA_EXTENSIONS: frozenset[str] = PHOTO_SUFFIXES | VIDEO_SUFFIXES
 
 
 @dataclass
