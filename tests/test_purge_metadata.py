@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 
 import pytest
-from ouestcharlie_toolkit.schema import METADATA_DIR
+from ouestcharlie_toolkit.storage import METADATA_DIR
 
 from whitebeard.agent import WhitebeardAgent
 

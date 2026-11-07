@@ -14,10 +14,9 @@ from unittest.mock import patch
 import pyarrow as pa
 import pytest
 from ouestcharlie_toolkit import PHOTO_SUFFIXES
-from ouestcharlie_toolkit.backends.local import LocalBackend
-from ouestcharlie_toolkit.lance_index import PHOTO_SCHEMA, PHOTO_TABLE_NAME, LanceIndex
-from ouestcharlie_toolkit.manifest import ManifestStore
-from ouestcharlie_toolkit.schema import LOWEST_SCHEMA_VERSION, SCHEMA_VERSION, RootSummary
+from ouestcharlie_toolkit.index import PHOTO_SCHEMA, PHOTO_TABLE_NAME, LanceIndex, SummaryStore
+from ouestcharlie_toolkit.model import LOWEST_SCHEMA_VERSION, SCHEMA_VERSION, RootSummary
+from ouestcharlie_toolkit.storage import LocalBackend
 from ouestcharlie_toolkit.xmp import XmpStore, parse_xmp, serialize_xmp
 from PIL import Image
 
@@ -211,7 +210,7 @@ async def test_index_partition_alone_does_not_write_summary(
 @pytest.mark.asyncio
 async def test_index_manifest_rating_in_lance_index(tmpdir: Path) -> None:
     """Rating extracted from EXIF/XMP ends up in the LanceDB row (aggregated at query time)."""
-    from ouestcharlie_toolkit.schema import PhotoEntry, XmpSidecar
+    from ouestcharlie_toolkit.model import PhotoEntry, XmpSidecar
 
     (tmpdir / "a.jpg").write_bytes(_MINIMAL_JPEG)
     (tmpdir / "b.jpg").write_bytes(_MINIMAL_JPEG)
@@ -587,7 +586,7 @@ async def test_index_library_indexes_all_partitions(tmpdir: Path) -> None:
 @pytest.mark.asyncio
 async def test_index_library_lance_rating_per_partition(tmpdir: Path) -> None:
     """Rating values land in the correct partition's LanceDB rows."""
-    from ouestcharlie_toolkit.schema import XmpSidecar
+    from ouestcharlie_toolkit.model import XmpSidecar
     from ouestcharlie_toolkit.xmp import serialize_xmp
 
     (tmpdir / "A").mkdir()
@@ -732,8 +731,8 @@ async def test_index_mixed_timezone_photos(tmpdir: Path) -> None:
     """
     from datetime import timedelta, timezone
 
-    from ouestcharlie_toolkit.backend import VersionToken
-    from ouestcharlie_toolkit.schema import PhotoEntry, XmpSidecar
+    from ouestcharlie_toolkit.model import PhotoEntry, XmpSidecar
+    from ouestcharlie_toolkit.storage import VersionToken
 
     naive_dt = datetime(2024, 7, 1, 12, 0, 0)
     aware_dt = datetime(2024, 7, 2, 12, 0, 0, tzinfo=timezone(timedelta(hours=2)))
@@ -841,7 +840,7 @@ async def test_index_library_forces_full_reindex_on_schema_upgrade(tmpdir: Path)
     await index_library(backend)
 
     # Downgrade below the lowest supported version to simulate a too-old index.
-    store = ManifestStore(backend)
+    store = SummaryStore(backend)
     _current_summary, version = await store.read_summary()
     stale = RootSummary(schema_version=LOWEST_SCHEMA_VERSION - 1)
     await store.write_summary(stale, version)
@@ -863,7 +862,7 @@ async def test_index_library_no_reindex_within_compatible_window(tmpdir: Path) -
     await index_library(backend)
 
     # Simulate an index one version behind but still within the compatible window.
-    store = ManifestStore(backend)
+    store = SummaryStore(backend)
     _current, version = await store.read_summary()
     await store.write_summary(RootSummary(schema_version=LOWEST_SCHEMA_VERSION), version)
 
@@ -899,7 +898,7 @@ async def test_index_library_raises_when_schema_newer(tmpdir: Path) -> None:
 
     await index_library(backend)
 
-    store = ManifestStore(backend)
+    store = SummaryStore(backend)
     _current_summary, version = await store.read_summary()
     newer = RootSummary(schema_version=SCHEMA_VERSION + 1)
     await store.write_summary(newer, version)
@@ -1556,7 +1555,7 @@ async def test_index_partition_scope_indexes_only_listed_partitions(tmpdir: Path
     (tmpdir / "2024" / "2024-09").mkdir(parents=True)
     (tmpdir / "2024" / "2024-09" / "c.jpg").write_bytes(_MINIMAL_JPEG)
     backend = LocalBackend(root=tmpdir)
-    await ManifestStore(backend).write_full_summary(RootSummary(schema_version=SCHEMA_VERSION))
+    await SummaryStore(backend).write_full_summary(RootSummary(schema_version=SCHEMA_VERSION))
 
     result = await index_partition_scope(backend, ["2024/2024-07", "2024/2024-08"])
 
@@ -1581,7 +1580,7 @@ async def test_index_partition_scope_rejects_missing_partition(tmpdir: Path, bad
     (tmpdir / "2024" / "2024-07").mkdir(parents=True)
     (tmpdir / "2024" / "2024-07" / "a.jpg").write_bytes(_MINIMAL_JPEG)
     backend = LocalBackend(root=tmpdir)
-    await ManifestStore(backend).write_full_summary(RootSummary(schema_version=SCHEMA_VERSION))
+    await SummaryStore(backend).write_full_summary(RootSummary(schema_version=SCHEMA_VERSION))
 
     with pytest.raises(ValueError, match="not found") as exc_info:
         await index_partition_scope(backend, ["2024/2024-07", bad])
@@ -1599,7 +1598,7 @@ async def test_index_partition_scope_accepts_existing_partition(tmpdir: Path, go
     (tmpdir / "2024" / "2024-07").mkdir(parents=True)
     (tmpdir / "2024" / "2024-07" / "a.jpg").write_bytes(_MINIMAL_JPEG)
     backend = LocalBackend(root=tmpdir)
-    await ManifestStore(backend).write_full_summary(RootSummary(schema_version=SCHEMA_VERSION))
+    await SummaryStore(backend).write_full_summary(RootSummary(schema_version=SCHEMA_VERSION))
 
     result = await index_partition_scope(backend, [good])
 
@@ -1633,7 +1632,7 @@ async def test_index_partition_scope_does_not_write_summary(tmpdir: Path) -> Non
     (tmpdir / "A").mkdir()
     (tmpdir / "A" / "p.jpg").write_bytes(_MINIMAL_JPEG)
     backend = LocalBackend(root=tmpdir)
-    store = ManifestStore(backend)
+    store = SummaryStore(backend)
     await store.write_full_summary(RootSummary(schema_version=SCHEMA_VERSION))
     before, _ = await store.read_summary()
 
@@ -1664,7 +1663,7 @@ async def test_index_partition_scope_raises_when_schema_too_old(tmpdir: Path) ->
     (tmpdir / "A").mkdir()
     (tmpdir / "A" / "p.jpg").write_bytes(_MINIMAL_JPEG)
     backend = LocalBackend(root=tmpdir)
-    store = ManifestStore(backend)
+    store = SummaryStore(backend)
     await store.write_full_summary(RootSummary(schema_version=LOWEST_SCHEMA_VERSION - 1))
 
     with pytest.raises(ValueError, match="older"):
@@ -1685,7 +1684,7 @@ async def test_index_partition_scope_accepts_compatible_window(tmpdir: Path) -> 
     await index_library(backend)  # establishes a real index + manifests
 
     # Downgrade the marker to the lowest supported version — still in the window.
-    store = ManifestStore(backend)
+    store = SummaryStore(backend)
     _current, version = await store.read_summary()
     await store.write_summary(RootSummary(schema_version=LOWEST_SCHEMA_VERSION), version)
 
@@ -1699,7 +1698,7 @@ async def test_index_partition_scope_raises_when_schema_newer(tmpdir: Path) -> N
     (tmpdir / "A").mkdir()
     (tmpdir / "A" / "p.jpg").write_bytes(_MINIMAL_JPEG)
     backend = LocalBackend(root=tmpdir)
-    store = ManifestStore(backend)
+    store = SummaryStore(backend)
     await store.write_full_summary(RootSummary(schema_version=SCHEMA_VERSION + 1))
 
     with pytest.raises(ValueError, match="newer"):
@@ -1719,7 +1718,7 @@ async def test_index_partition_scope_progress_callback_called_for_each_partition
         (tmpdir / name).mkdir()
         (tmpdir / name / "p.jpg").write_bytes(_MINIMAL_JPEG)
     backend = LocalBackend(root=tmpdir)
-    await ManifestStore(backend).write_full_summary(RootSummary(schema_version=SCHEMA_VERSION))
+    await SummaryStore(backend).write_full_summary(RootSummary(schema_version=SCHEMA_VERSION))
 
     calls = []
 
