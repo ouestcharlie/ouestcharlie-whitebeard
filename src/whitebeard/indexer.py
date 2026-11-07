@@ -11,24 +11,21 @@ from datetime import UTC, datetime
 from itertools import chain, islice
 from pathlib import Path, PurePath
 
-from ouestcharlie_toolkit.backend import Backend
-from ouestcharlie_toolkit.lance_index import PHOTO_TABLE_NAME, LanceIndex
-from ouestcharlie_toolkit.manifest import ManifestStore
-from ouestcharlie_toolkit.photo import PHOTO_SUFFIXES
-from ouestcharlie_toolkit.schema import (
+from ouestcharlie_toolkit.index import PHOTO_TABLE_NAME, LanceIndex, SummaryStore
+from ouestcharlie_toolkit.media import PHOTO_SUFFIXES, VIDEO_SUFFIXES
+from ouestcharlie_toolkit.model import (
+    DEFAULT_EXCLUDED_TAG_PREFIXES,
     LOWEST_SCHEMA_VERSION,
-    METADATA_DIR,
     SCHEMA_VERSION,
     PhotoEntry,
     RootSummary,
     ThumbnailChunk,
 )
-from ouestcharlie_toolkit.tags import DEFAULT_EXCLUDED_TAG_PREFIXES
-from ouestcharlie_toolkit.thumbnail_builder import (
+from ouestcharlie_toolkit.renditions import (
     delete_partition_thumbnails,
     generate_partition_thumbnails,
 )
-from ouestcharlie_toolkit.video import VIDEO_SUFFIXES
+from ouestcharlie_toolkit.storage import METADATA_DIR, Backend
 from ouestcharlie_toolkit.xmp import XmpStore, sidecar_candidates
 
 _log = logging.getLogger(__name__)
@@ -502,7 +499,7 @@ async def index_library(
             upgraded before it can safely index this library).
     """
     library_result = LibraryIndexResult()
-    manifest_store = ManifestStore(backend)
+    manifest_store = SummaryStore(backend)
 
     # Schema-version handling:
     #   > SCHEMA_VERSION           → refuse (software too old for this index).
@@ -658,7 +655,7 @@ async def index_partition_scope(
             ``partition_scope`` is not an existing folder of the library.
     """
     library_result = LibraryIndexResult()
-    manifest_store = ManifestStore(backend)
+    manifest_store = SummaryStore(backend)
 
     try:
         existing_summary, _ = await manifest_store.read_summary()

@@ -6,8 +6,8 @@ import logging
 from typing import Any
 
 from mcp.server.mcpserver import Context
-from ouestcharlie_toolkit.schema import METADATA_DIR
-from ouestcharlie_toolkit.server import AgentBase
+from ouestcharlie_toolkit.agent import AgentBase
+from ouestcharlie_toolkit.storage import METADATA_DIR
 
 from .indexer import index_library, index_partition_scope
 

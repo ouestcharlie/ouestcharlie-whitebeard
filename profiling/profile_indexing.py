@@ -22,9 +22,9 @@ from datetime import datetime
 from pathlib import Path, PurePath
 
 from dotenv import dotenv_values
-from ouestcharlie_toolkit.backends.local import LocalBackend
-from ouestcharlie_toolkit.lance_index import PHOTO_TABLE_NAME, LanceIndex
-from ouestcharlie_toolkit.thumbnail_builder import generate_partition_thumbnails
+from ouestcharlie_toolkit.index import PHOTO_TABLE_NAME, LanceIndex
+from ouestcharlie_toolkit.renditions import generate_partition_thumbnails
+from ouestcharlie_toolkit.storage import LocalBackend
 from ouestcharlie_toolkit.xmp import XmpStore
 
 from whitebeard.indexer import (

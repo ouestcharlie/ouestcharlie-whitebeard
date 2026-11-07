@@ -20,7 +20,7 @@ classifiers = [
 ]
 dependencies = [
     "mcp>=2.0,<3.0.0",
-    "ouestcharlie-py-toolkit>=0.16.0",
+    "ouestcharlie-py-toolkit>=0.17.0",
 ]
 
 [project.urls]
