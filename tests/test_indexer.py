@@ -13,11 +13,13 @@ from unittest.mock import patch
 
 import pyarrow as pa
 import pytest
+from ouestcharlie_toolkit import PHOTO_SUFFIXES
 from ouestcharlie_toolkit.backends.local import LocalBackend
 from ouestcharlie_toolkit.lance_index import PHOTO_SCHEMA, PHOTO_TABLE_NAME, LanceIndex
 from ouestcharlie_toolkit.manifest import ManifestStore
 from ouestcharlie_toolkit.schema import LOWEST_SCHEMA_VERSION, SCHEMA_VERSION, RootSummary
 from ouestcharlie_toolkit.xmp import XmpStore, parse_xmp, serialize_xmp
+from PIL import Image
 
 from whitebeard.indexer import (
     _MAX_CONCURRENT_PARTITIONS,
@@ -300,6 +302,90 @@ async def test_index_ignores_non_photo_files(tmpdir: Path) -> None:
     result = await index_partition(backend, "")
 
     assert result.photos_processed == 1  # only photo.jpg
+
+
+@pytest.mark.asyncio
+async def test_index_discovers_every_photo_suffix(tmpdir: Path) -> None:
+    """Every extension in the shared toolkit list is picked up, in any case."""
+    names = [f"photo{i}{ext}" for i, ext in enumerate(sorted(PHOTO_SUFFIXES))]
+    names.append("upper.JXL")
+    for name in names:
+        (tmpdir / name).write_bytes(b"x")
+    backend = LocalBackend(root=tmpdir)
+
+    seen: list[str] = []
+
+    async def _fake_extract(_store: XmpStore, photo_path: str, _force: bool) -> None:
+        seen.append(photo_path)
+        raise RuntimeError("not decoded in this test")
+
+    with patch("whitebeard.indexer._extract_one", side_effect=_fake_extract):
+        await index_partition(backend, "")
+
+    assert sorted(seen) == sorted(names)
+
+
+@pytest.mark.asyncio
+async def test_index_ignores_rapidraw_files(tmpdir: Path) -> None:
+    """RapidRAW edit data, original EXIF copies and presets are not media."""
+    (tmpdir / "photo.jpg").write_bytes(_MINIMAL_JPEG)
+    for name in ("photo.jpg.rrdata", "photo.rrexif", "look.rrpreset"):
+        (tmpdir / name).write_text("{}")
+    backend = LocalBackend(root=tmpdir)
+
+    result = await index_partition(backend, "")
+
+    assert result.photos_processed == 1
+    assert result.errors == 0
+
+
+def _write_format_samples(directory: Path) -> list[str]:
+    """Write a small photo with EXIF in every format Pillow can write."""
+    img = Image.new("RGB", (64, 48))
+    img.putdata([(x * 4, y * 5, 128) for y in range(48) for x in range(64)])
+    exif = Image.Exif()
+    exif[271] = "TestMake"
+    exif[274] = 6
+    names = []
+    for ext in (".jpg", ".png", ".tif", ".webp", ".avif", ".gif", ".bmp"):
+        name = f"photo{ext}"
+        if ext in (".gif", ".bmp"):
+            img.save(directory / name)
+        else:
+            img.save(directory / name, exif=exif.tobytes())
+        names.append(name)
+    return names
+
+
+@pytest.mark.asyncio
+async def test_index_standard_formats_with_thumbnails(tmpdir: Path) -> None:
+    """JPEG, PNG, TIFF, WebP, AVIF, GIF and BMP are indexed and get a thumbnail tile."""
+    names = _write_format_samples(tmpdir)
+    backend = LocalBackend(root=tmpdir)
+
+    result = await index_partition(backend, "", generate_thumbnails=True)
+
+    assert result.errors == 0
+    assert result.photos_processed == len(names)
+    lance_index = await LanceIndex.open(backend, PHOTO_TABLE_NAME)
+    rows = [r async for r in lance_index.get_partition_rows("")]
+    assert sorted(r["filename"] for r in rows) == sorted(names)
+
+
+@pytest.mark.asyncio
+async def test_index_corrupt_photo_is_one_error(tmpdir: Path) -> None:
+    """A truncated file is reported as one error; the rest of the partition is indexed."""
+    names = _write_format_samples(tmpdir)
+    (tmpdir / "broken.jxl").write_bytes(b"\xff\x0a")
+    (tmpdir / "broken.avif").write_bytes(b"\x00\x00\x00\x18ftypavif")
+    backend = LocalBackend(root=tmpdir)
+
+    result = await index_partition(backend, "", generate_thumbnails=True)
+
+    assert result.errors == 2
+    lance_index = await LanceIndex.open(backend, PHOTO_TABLE_NAME)
+    rows = [r async for r in lance_index.get_partition_rows("")]
+    assert sorted(r["filename"] for r in rows) == sorted(names)
 
 
 @pytest.mark.asyncio
