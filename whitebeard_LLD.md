@@ -124,6 +124,6 @@ Per MCP convention: exceptions in tool handlers are always logged with `exc_info
 
 ## References
 
-- [HLD.md](../ouestcharlie/HLD.md) — system architecture, agent role
-- [py_toolkit_LLD.md](../ouestcharlie-py-toolkit/py_toolkit_LLD.md) — `XmpStore`, `ManifestStore`, `Backend`, thumbnail builder
-- [agent_LLD_rationale.md](../ouestcharlie/agent/agent_LLD_rationale.md) — agent design decisions
+- [HLD.md](https://github.com/ouestcharlie/ouestcharlie/blob/master/design/HLD.md) — system architecture, agent role
+- [py_toolkit_LLD.md](https://github.com/ouestcharlie/ouestcharlie-py-toolkit/blob/master/py_toolkit_LLD.md) — `XmpStore`, `ManifestStore`, `Backend`, thumbnail builder
+- [agent_LLD_rationale.md](https://github.com/ouestcharlie/ouestcharlie/blob/master/design/agent_LLD_rationale.md) — agent design decisions
