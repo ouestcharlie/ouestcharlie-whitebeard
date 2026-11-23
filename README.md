@@ -1,5 +1,8 @@
 # Whitebeard: Photo library indexer
 
+> [!WARNING]
+> **This repository is no longer maintained.** Its code has been merged into the [OuEstCharlie main repository](https://github.com/ouestcharlie/ouestcharlie), under [`packages/whitebeard`](https://github.com/ouestcharlie/ouestcharlie/tree/master/packages/whitebeard). Please open issues and pull requests there.
+
 Whitebeard is the **indexing agent** for OuEstCharlie. It operates in **index mode**:
 scan an existing local photo library in place (no files moved), create XMP sidecars
 with `ouestcharlie:` fields, and write leaf manifests.
